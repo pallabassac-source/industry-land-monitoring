@@ -27,24 +27,24 @@ html, body, #root {
   background: #94a3b8;
 }
 
-/* Beeping Highlight pulse animation for map search targets */
-@keyframes beepPulse {
+/* Calm Breathing Highlight pulse animation for map search targets */
+@keyframes calmGlowPulse {
   0%, 100% {
-    fill: #ff0055;
-    fill-opacity: 0.25;
-    stroke: #ff0055;
-    stroke-width: 2px;
+    fill: #38bdf8;
+    fill-opacity: 0.30;
+    stroke: #0284c7;
+    stroke-width: 3px;
+    filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.4));
   }
   50% {
-    fill: #ff0055;
-    fill-opacity: 0.95;
-    stroke: #ff0055;
-    stroke-width: 6px;
-    filter: drop-shadow(0 0 12px #ff0055);
+    fill: #38bdf8;
+    fill-opacity: 0.65;
+    stroke: #0284c7;
+    stroke-width: 5px;
+    filter: drop-shadow(0 0 12px rgba(56, 189, 248, 0.8));
   }
 }
 
 .animate-beep-highlight {
-  animation: beepPulse 0.5s infinite ease-in-out;
+  animation: calmGlowPulse 1.8s infinite ease-in-out;
 }
-

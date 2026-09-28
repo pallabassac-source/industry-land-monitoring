@@ -2,11 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store/useStore.ts';
 import { 
   Layers, Compass, ZoomIn, ZoomOut, Ruler,
-  ChevronRight, ChevronDown, Info, Sliders, Search, Home, MapPin, Trash2, Edit3
+  ChevronRight, ChevronDown, Info, Sliders, Search, Home, MapPin, Trash2, Edit3,
+  Filter, X, RefreshCw, CheckCircle2, AlertCircle, Building2
 } from 'lucide-react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-
 const createPinMarkerImage = (colorHex: string): ImageData => {
   const canvas = document.createElement('canvas');
   canvas.width = 36;
@@ -202,6 +202,17 @@ const calculateGeodesicArea = (points: [number, number][]): number => {
   return totalArea;
 };
 
+// Helper to normalize plot status string
+const normalizeStatus = (status?: string): string => {
+  if (!status) return '';
+  const s = status.trim().toUpperCase();
+  if (s === 'VACAN' || s === 'VACANT' || s === 'AVAILABLE') return 'Vacan';
+  if (s === 'OCCUPIED' || s === 'ALLOCATED') return 'Occupied';
+  if (s === 'DOUBTFUL' || s === 'DISPUTE') return 'Doubtful';
+  if (s === 'INNER ROAD' || s === 'INNER_ROAD' || s === 'ROAD') return 'Inner Road';
+  return status;
+};
+
 interface MapViewProps {
   isMapExpanded?: boolean;
   onToggleSplitScreen?: () => void;
@@ -247,11 +258,12 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
   const [expandedAccordion, setExpandedAccordion] = useState<'layers' | 'measure' | 'identify' | null>('layers');
 
   // Search tab local filter values
+  const [filterKeyword, setFilterKeyword] = useState('');
   const [filterDistrictId, setFilterDistrictId] = useState('');
   const [filterEstateId, setFilterEstateId] = useState('');
   const [filterPlotStatus, setFilterPlotStatus] = useState('');
   const [filterParcelId, setFilterParcelId] = useState('');
-  const [isBeeping, setIsBeeping] = useState(false);
+  const [searchFeedback, setSearchFeedback] = useState<{ message: string; type: 'success' | 'info' | 'warning' } | null>(null);
 
   // Setup refs to prevent closures in MapLibre event listeners
   const measurementModeRef = useRef(measurementMode);
@@ -302,8 +314,9 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
           name: p.plotNumber || p.parcelId || `Plot ${p.id}`, 
           plotNumber: p.plotNumber || p.parcelId,
           parcelId: p.parcelId,
+          estateId: p.estateId,
           type: 'Parcel', 
-          status: p.availabilityStatus, 
+          status: normalizeStatus(p.availabilityStatus), 
           areaAcres: p.areaAcres,
           data: JSON.stringify(p) 
         },
@@ -435,10 +448,6 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
         data: { type: 'FeatureCollection', features: [] }
       });
       map.addSource('spatial-query-results', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] }
-      });
-      map.addSource('selected-parcel-highlight', {
         type: 'geojson',
         data: { type: 'FeatureCollection', features: [] }
       });
@@ -682,28 +691,6 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
         }
       });
 
-      // Selection Highlight Layer (Beeping vibrant color)
-      map.addLayer({
-        id: 'selected-parcel-highlight-layer',
-        type: 'fill',
-        source: 'selected-parcel-highlight',
-        paint: {
-          'fill-color': '#ff0055',
-          'fill-outline-color': '#ff0055',
-          'fill-opacity': 0.85
-        }
-      });
-      map.addLayer({
-        id: 'selected-parcel-highlight-outline',
-        type: 'line',
-        source: 'selected-parcel-highlight',
-        paint: {
-          'line-color': '#ff0055',
-          'line-width': 4,
-          'line-opacity': 1
-        }
-      });
-
       // Force initial sync of layer states
       syncLayerSettings(map);
 
@@ -761,6 +748,31 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
         }
       }
     });
+
+    // Dynamic filtering for parcel layers when status or estate filter is selected
+    const parcelLayers = ['parcels-layer', 'parcels-outline', 'parcels-markers', 'parcels-labels'];
+    let parcelFilter: any = null;
+    const filterConditions: any[] = ['all'];
+
+    if (filterPlotStatus) {
+      filterConditions.push(['==', ['get', 'status'], filterPlotStatus]);
+    }
+    if (filterEstateId) {
+      filterConditions.push(['==', ['get', 'estateId'], Number(filterEstateId)]);
+    }
+    if (filterParcelId) {
+      filterConditions.push(['==', ['get', 'id'], Number(filterParcelId)]);
+    }
+
+    if (filterConditions.length > 1) {
+      parcelFilter = filterConditions.length === 2 ? filterConditions[1] : filterConditions;
+    }
+
+    parcelLayers.forEach(id => {
+      if (map.getLayer(id)) {
+        map.setFilter(id, parcelFilter);
+      }
+    });
   };
 
   // Helper to fit map camera bounding box to active uploaded layers (Parcels / Estates)
@@ -800,29 +812,44 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     if (minLng !== Infinity && maxLng !== -Infinity && (maxLng - minLng > 0.0001 || maxLat - minLat > 0.0001)) {
       map.fitBounds(
         [[minLng, minLat], [maxLng, maxLat]],
-        { padding: 80, maxZoom: 16, duration: 1200 }
+        { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
       );
     } else if (minLng !== Infinity) {
-      map.flyTo({ center: [minLng, minLat], zoom: 15, essential: true });
+      map.flyTo({
+        center: [minLng, minLat],
+        zoom: 15.5,
+        duration: 2200,
+        speed: 0.75,
+        curve: 1.42,
+        essential: true,
+        easing: (t) => 1 - Math.pow(1 - t, 3)
+      });
     }
   };
 
   useEffect(() => {
-    if (mapInstanceRef.current) {
+    if (mapInstanceRef.current && mapInstanceRef.current.isStyleLoaded()) {
       syncLayerSettings(mapInstanceRef.current);
     }
-  }, [layers]);
+  }, [layers, filterPlotStatus, filterEstateId, filterParcelId]);
 
-  // Handle coordinates flyTo
+  // Handle coordinates flyTo smoothly
   useEffect(() => {
     if (!mapInstanceRef.current) return;
     const map = mapInstanceRef.current;
     const currentCenter = map.getCenter();
-    if (Math.abs(currentCenter.lng - mapCenter[0]) > 0.001 || Math.abs(currentCenter.lat - mapCenter[1]) > 0.001) {
+    const currentZoom = map.getZoom();
+    const distDiff = Math.abs(currentCenter.lng - mapCenter[0]) + Math.abs(currentCenter.lat - mapCenter[1]);
+    const zoomDiff = Math.abs(currentZoom - mapZoom);
+    if (distDiff > 0.0005 || zoomDiff > 0.1) {
       map.flyTo({
         center: [mapCenter[0], mapCenter[1]],
         zoom: mapZoom,
-        essential: true
+        duration: 2200,
+        speed: 0.75,
+        curve: 1.42,
+        essential: true,
+        easing: (t) => 1 - Math.pow(1 - t, 3)
       });
     }
   }, [mapCenter, mapZoom]);
@@ -839,7 +866,17 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
           type: 'FeatureCollection',
           features: parcels.map(p => ({
             type: 'Feature' as const,
-            properties: { id: p.id, name: p.parcelId || p.plotNumber, type: 'Parcel', status: p.availabilityStatus, data: JSON.stringify(p) },
+            properties: { 
+              id: p.id, 
+              name: p.plotNumber || p.parcelId || `Plot ${p.id}`, 
+              plotNumber: p.plotNumber || p.parcelId,
+              parcelId: p.parcelId,
+              estateId: p.estateId,
+              type: 'Parcel', 
+              status: normalizeStatus(p.availabilityStatus), 
+              areaAcres: p.areaAcres,
+              data: JSON.stringify(p) 
+            },
             geometry: wktToGeoJson(p.geom)
           })).filter(f => f.geometry !== null) as any
         });
@@ -954,31 +991,6 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     }
   }, [spatialQueryResults]);
 
-  // Update highlight layer on selected parcel change
-  useEffect(() => {
-    if (!mapInstanceRef.current) return;
-    const map = mapInstanceRef.current;
-    if (!map.isStyleLoaded()) return;
-    const source = map.getSource('selected-parcel-highlight') as maplibregl.GeoJSONSource;
-    if (source) {
-      if (selectedFeature && selectedFeature.data && selectedFeature.data.geom) {
-        const geojson = wktToGeoJson(selectedFeature.data.geom);
-        if (geojson) {
-          source.setData({
-            type: 'FeatureCollection',
-            features: [{
-              type: 'Feature' as const,
-              geometry: geojson,
-              properties: { name: selectedFeature.name }
-            }]
-          });
-          return;
-        }
-      }
-      source.setData({ type: 'FeatureCollection', features: [] });
-    }
-  }, [selectedFeature]);
-
   // Render Location Pointer Marker & Brief Details Popup on MapView when feature selected
   useEffect(() => {
     if (!mapInstanceRef.current) return;
@@ -1001,20 +1013,31 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
 
     if (!center || isNaN(center[0]) || isNaN(center[1])) return;
 
-    // Create custom DOM element for Location Pointer Marker with pulsing ring
+    const status = normalizeStatus(data.availabilityStatus || data.status);
+    let pointerGradient = 'from-sky-600 to-blue-600';
+
+    if (status === 'Vacan') {
+      pointerGradient = 'from-emerald-600 to-green-500';
+    } else if (status === 'Occupied') {
+      pointerGradient = 'from-rose-600 to-red-500';
+    } else if (status === 'Doubtful') {
+      pointerGradient = 'from-amber-600 to-yellow-500';
+    } else if (status === 'Inner Road') {
+      pointerGradient = 'from-slate-600 to-slate-500';
+    }
+
+    // Create custom DOM element for Location Pointer Marker with fixed dimensions
     const el = document.createElement('div');
-    el.className = 'location-pointer-pin relative flex items-center justify-center cursor-pointer group z-30';
+    el.className = 'location-pointer-pin relative w-9 h-9 flex items-center justify-center cursor-pointer group z-30 flex-shrink-0';
     el.innerHTML = `
-      <div class="absolute -inset-3 bg-rose-500/40 rounded-full animate-ping pointer-events-none"></div>
-      <div class="relative z-10 bg-gradient-to-tr from-rose-600 to-rose-500 text-white p-2 rounded-full shadow-2xl border-2 border-white flex items-center justify-center transform group-hover:scale-125 transition-transform duration-200">
-        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <div class="relative z-10 w-9 h-9 bg-gradient-to-tr ${pointerGradient} text-white rounded-full shadow-xl border-2 border-white flex items-center justify-center transform group-hover:scale-110 transition-transform duration-200 flex-shrink-0">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/>
           <circle cx="12" cy="10" r="3"/>
         </svg>
       </div>
     `;
 
-    const status = data.availabilityStatus || data.status || 'Vacan';
     const statusBg = status === 'Vacan' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
                      status === 'Occupied' ? 'bg-rose-50 text-rose-700 border-rose-200' :
                      status === 'Doubtful' ? 'bg-yellow-50 text-yellow-800 border-yellow-300' :
@@ -1030,7 +1053,7 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     popupContent.innerHTML = `
       <div class="flex items-center justify-between gap-2 border-b border-slate-100 pb-1.5">
         <span class="font-extrabold text-xs text-slate-800 truncate">${title}</span>
-        <span class="px-2 py-0.5 rounded text-[9px] font-black uppercase border flex-shrink-0 ${statusBg}">${status}</span>
+        <span class="px-2 py-0.5 rounded text-[9px] font-black uppercase border flex-shrink-0 ${statusBg}">${status || 'Feature'}</span>
       </div>
       <div class="space-y-1 text-slate-600">
         ${area ? `<div class="flex justify-between items-center"><span class="font-bold text-slate-400 text-[10px] uppercase">Area:</span> <span class="font-extrabold text-slate-800">${area}</span></div>` : ''}
@@ -1059,76 +1082,18 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     activeMarkerRef.current = marker;
     activePopupRef.current = popup;
 
-    // Pan map camera smoothly to center location
+    // Pan map camera smoothly to center location with gentle 2.2s glide
     map.flyTo({
       center: [center[0], center[1]],
-      zoom: 16,
-      essential: true
+      zoom: 16.5,
+      duration: 2200,
+      speed: 0.75,
+      curve: 1.42,
+      essential: true,
+      easing: (t) => 1 - Math.pow(1 - t, 3)
     });
 
   }, [selectedFeature]);
-
-  // Web Audio radar audio beep sound helper
-  const playRadarBeep = () => {
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-      const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(880, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(1760, ctx.currentTime + 0.15);
-      gain.gain.setValueAtTime(0.25, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.2);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.25);
-    } catch (e) {}
-  };
-
-  // Beeping animation frame loop for MapLibre GL JS highlight layer
-  useEffect(() => {
-    if (!isBeeping || !selectedFeature) return;
-
-    playRadarBeep();
-
-    let animFrameId: number;
-    let startTime = performance.now();
-
-    const animateBeep = (now: number) => {
-      const elapsed = (now - startTime) / 1000;
-      // Oscillate opacity between 0.15 and 0.95 at ~3 Hz pulse rate
-      const pulseOpacity = 0.55 + 0.4 * Math.sin(elapsed * Math.PI * 6);
-      const pulseLineWidth = 3 + 5 * (0.5 + 0.5 * Math.sin(elapsed * Math.PI * 6));
-
-      if (mapInstanceRef.current && mapInstanceRef.current.isStyleLoaded()) {
-        const map = mapInstanceRef.current;
-        if (map.getLayer('selected-parcel-highlight-layer')) {
-          map.setPaintProperty('selected-parcel-highlight-layer', 'fill-color', '#ff0055');
-          map.setPaintProperty('selected-parcel-highlight-layer', 'fill-opacity', pulseOpacity);
-        }
-        if (map.getLayer('selected-parcel-highlight-outline')) {
-          map.setPaintProperty('selected-parcel-highlight-outline', 'line-color', '#ff0055');
-          map.setPaintProperty('selected-parcel-highlight-outline', 'line-width', pulseLineWidth);
-        }
-      }
-
-      animFrameId = requestAnimationFrame(animateBeep);
-    };
-
-    animFrameId = requestAnimationFrame(animateBeep);
-
-    const timer = setTimeout(() => {
-      setIsBeeping(false);
-    }, 10000);
-
-    return () => {
-      cancelAnimationFrame(animFrameId);
-      clearTimeout(timer);
-    };
-  }, [isBeeping, selectedFeature]);
 
   // Disable double click zoom when measurement or spatial query panel is active
   useEffect(() => {
@@ -1203,50 +1168,298 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     return layers.find(l => l.name === name)?.opacity ?? 1;
   };
 
-  // Local drop filters calculations
+  // Local cascading dropdown filters calculations
   const filteredEstates = filterDistrictId 
     ? estates.filter(e => e.districtId === Number(filterDistrictId)) 
     : estates;
 
-  const filteredParcels = filterEstateId 
-    ? parcels.filter(p => p.estateId === Number(filterEstateId)) 
-    : parcels;
-
-  const filteredParcelsByStatus = filteredParcels.filter(p => {
-    if (!filterPlotStatus) return true;
-    const s = (p.availabilityStatus || '').toUpperCase();
-    if (filterPlotStatus === 'Vacan') return s === 'VACAN' || s === 'VACANT' || s === 'AVAILABLE';
-    if (filterPlotStatus === 'Occupied') return s === 'OCCUPIED' || s === 'ALLOCATED';
-    if (filterPlotStatus === 'Doubtful') return s === 'DOUBTFUL' || s === 'DISPUTE';
-    if (filterPlotStatus === 'Inner Road') return s === 'INNER ROAD' || s === 'INNER_ROAD' || s === 'ROAD';
-    return s === filterPlotStatus.toUpperCase();
+  const filteredParcelsByEstate = parcels.filter(p => {
+    if (filterEstateId) {
+      return p.estateId === Number(filterEstateId);
+    }
+    if (filterDistrictId) {
+      const estate = estates.find(e => e.id === p.estateId);
+      return estate?.districtId === Number(filterDistrictId);
+    }
+    return true;
   });
+
+  const filteredParcels = filteredParcelsByEstate.filter(p => {
+    if (filterPlotStatus) {
+      if (normalizeStatus(p.availabilityStatus) !== normalizeStatus(filterPlotStatus)) {
+        return false;
+      }
+    }
+    if (filterKeyword.trim()) {
+      const kw = filterKeyword.trim().toLowerCase();
+      const pId = (p.parcelId || '').toLowerCase();
+      const pNum = (p.plotNumber || '').toLowerCase();
+      const sNum = (p.surveyNumber || '').toLowerCase();
+      const estate = estates.find(e => e.id === p.estateId);
+      const eName = (estate?.name || '').toLowerCase();
+      if (!pId.includes(kw) && !pNum.includes(kw) && !sNum.includes(kw) && !eName.includes(kw)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // Calculate status counts for quick chips
+  const statusCounts = {
+    all: filteredParcelsByEstate.length,
+    vacan: filteredParcelsByEstate.filter(p => normalizeStatus(p.availabilityStatus) === 'Vacan').length,
+    occupied: filteredParcelsByEstate.filter(p => normalizeStatus(p.availabilityStatus) === 'Occupied').length,
+    doubtful: filteredParcelsByEstate.filter(p => normalizeStatus(p.availabilityStatus) === 'Doubtful').length,
+    road: filteredParcelsByEstate.filter(p => normalizeStatus(p.availabilityStatus) === 'Inner Road').length,
+  };
+
+  const activeFiltersCount = (filterDistrictId ? 1 : 0) + 
+                             (filterEstateId ? 1 : 0) + 
+                             (filterPlotStatus ? 1 : 0) + 
+                             (filterParcelId ? 1 : 0) + 
+                             (filterKeyword.trim() ? 1 : 0);
+
+  const handleQuickStatusClick = (status: string) => {
+    const nextStatus = filterPlotStatus === status ? '' : status;
+    setFilterPlotStatus(nextStatus);
+    setFilterParcelId('');
+    setSelectedFeature(null);
+    setSearchFeedback(null);
+
+    if (!nextStatus) {
+      useStore.setState({ spatialQueryResults: [] });
+      return;
+    }
+
+    const matching = filteredParcelsByEstate.filter(p => normalizeStatus(p.availabilityStatus) === nextStatus);
+
+    if (matching.length > 0 && mapInstanceRef.current) {
+      const map = mapInstanceRef.current;
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      matching.forEach(p => {
+        const g = wktToGeoJson(p.geom);
+        if (!g) return;
+        const extractCoords = (coords: any) => {
+          if (Array.isArray(coords[0])) coords.forEach(extractCoords);
+          else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+            const [lng, lat] = coords;
+            if (lng < minLng) minLng = lng;
+            if (lat < minLat) minLat = lat;
+            if (lng > maxLng) maxLng = lng;
+            if (lat > maxLat) maxLat = lat;
+          }
+        };
+        extractCoords(g.coordinates);
+      });
+
+      if (minLng !== Infinity && maxLng !== -Infinity) {
+        map.fitBounds(
+          [[minLng, minLat], [maxLng, maxLat]],
+          { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+        );
+      }
+    }
+
+    const estName = filterEstateId ? (estates.find(e => e.id === Number(filterEstateId))?.name || 'Estate') : 'all estates';
+    setSearchFeedback({
+      message: `Showing ${matching.length} ${nextStatus} plot${matching.length !== 1 ? 's' : ''} in ${estName}.`,
+      type: 'info'
+    });
+  };
 
   // Search actions triggers
   const handleSearchIE = () => {
+    if (!mapInstanceRef.current) return;
+    const map = mapInstanceRef.current;
+
+    // 1. Specific Plot Selected
     if (filterParcelId) {
       const p = parcels.find(x => x.id === Number(filterParcelId));
       if (p) {
         const center = getWktCenter(p.geom);
-        zoomToCoordinates(center[0], center[1], 15);
+        map.flyTo({
+          center: [center[0], center[1]],
+          zoom: 16.5,
+          duration: 2200,
+          speed: 0.75,
+          curve: 1.42,
+          essential: true,
+          easing: (t) => 1 - Math.pow(1 - t, 3)
+        });
         setSelectedFeature({ type: 'Parcel', name: p.parcelId, data: p });
-        setIsBeeping(true);
+        setSearchFeedback({
+          message: `Pinpointed Plot ${p.parcelId} (${p.plotNumber}) • ${p.availabilityStatus} (${p.areaAcres} Acres)`,
+          type: 'success'
+        });
+        setSearchBannerOpen(false);
+        return;
       }
-    } else if (filterEstateId) {
+    }
+
+    // 2. Status Filter Selected (without specific plot)
+    if (filterPlotStatus) {
+      const matching = filteredParcels;
+      if (matching.length === 0) {
+        setSelectedFeature(null);
+        setSearchFeedback({
+          message: `No ${filterPlotStatus} plots found matching current filters.`,
+          type: 'warning'
+        });
+        return;
+      }
+
+      if (matching.length === 1) {
+        const p = matching[0];
+        const center = getWktCenter(p.geom);
+        map.flyTo({
+          center: [center[0], center[1]],
+          zoom: 16.5,
+          duration: 2200,
+          speed: 0.75,
+          curve: 1.42,
+          essential: true,
+          easing: (t) => 1 - Math.pow(1 - t, 3)
+        });
+        setSelectedFeature({ type: 'Parcel', name: p.parcelId, data: p });
+        setSearchFeedback({
+          message: `Found 1 ${filterPlotStatus} plot: ${p.parcelId} (${p.plotNumber})`,
+          type: 'success'
+        });
+        setSearchBannerOpen(false);
+        return;
+      }
+
+      // Multiple plots matching -> clear previous single feature and fit map bounds
+      setSelectedFeature(null);
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      matching.forEach(p => {
+        const g = wktToGeoJson(p.geom);
+        if (!g) return;
+        const extractCoords = (coords: any) => {
+          if (Array.isArray(coords[0])) coords.forEach(extractCoords);
+          else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+            const [lng, lat] = coords;
+            if (lng < minLng) minLng = lng;
+            if (lat < minLat) minLat = lat;
+            if (lng > maxLng) maxLng = lng;
+            if (lat > maxLat) maxLat = lat;
+          }
+        };
+        extractCoords(g.coordinates);
+      });
+
+      if (minLng !== Infinity && maxLng !== -Infinity) {
+        map.fitBounds(
+          [[minLng, minLat], [maxLng, maxLat]],
+          { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+        );
+      }
+
+      const estName = filterEstateId ? (estates.find(e => e.id === Number(filterEstateId))?.name || 'Estate') : 'all estates';
+      setSearchFeedback({
+        message: `Showing ${matching.length} ${filterPlotStatus} plots in ${estName}.`,
+        type: 'info'
+      });
+      setSearchBannerOpen(false);
+      return;
+    }
+
+    // 3. Estate Filter Selected
+    if (filterEstateId) {
       const e = estates.find(x => x.id === Number(filterEstateId));
       if (e) {
-        const center = getWktCenter(e.geom);
-        zoomToCoordinates(center[0], center[1], 14);
+        const estParcels = parcels.filter(p => p.estateId === e.id);
+        const g = wktToGeoJson(e.geom);
+        if (g) {
+          let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+          const extractCoords = (coords: any) => {
+            if (Array.isArray(coords[0])) coords.forEach(extractCoords);
+            else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+              const [lng, lat] = coords;
+              if (lng < minLng) minLng = lng;
+              if (lat < minLat) minLat = lat;
+              if (lng > maxLng) maxLng = lng;
+              if (lat > maxLat) maxLat = lat;
+            }
+          };
+          extractCoords(g.coordinates);
+          if (minLng !== Infinity && maxLng !== -Infinity) {
+            map.fitBounds(
+              [[minLng, minLat], [maxLng, maxLat]],
+              { padding: 90, maxZoom: 15.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+            );
+          } else {
+            const center = getWktCenter(e.geom);
+            map.flyTo({
+              center: [center[0], center[1]],
+              zoom: 15,
+              duration: 2200,
+              speed: 0.75,
+              curve: 1.42,
+              essential: true,
+              easing: (t) => 1 - Math.pow(1 - t, 3)
+            });
+          }
+        }
         setSelectedFeature({ type: 'Estate', name: e.name, data: e });
-        setIsBeeping(true);
+        setSearchFeedback({
+          message: `Focused on ${e.name} (${estParcels.length} registered plots).`,
+          type: 'info'
+        });
+        setSearchBannerOpen(false);
+        return;
       }
-    } else if (filterDistrictId) {
+    }
+
+    // 4. District Filter Selected
+    if (filterDistrictId) {
       const d = districts.find(x => x.id === Number(filterDistrictId));
       if (d) {
         const center = getWktCenter(d.geom);
-        zoomToCoordinates(center[0], center[1], 11);
+        map.flyTo({
+          center: [center[0], center[1]],
+          zoom: 11,
+          duration: 2200,
+          speed: 0.75,
+          curve: 1.42,
+          essential: true,
+          easing: (t) => 1 - Math.pow(1 - t, 3)
+        });
         setSelectedFeature({ type: 'District', name: d.name, data: d });
-        setIsBeeping(true);
+        setSearchFeedback({
+          message: `Focused on ${d.name} District.`,
+          type: 'info'
+        });
+        setSearchBannerOpen(false);
+        return;
+      }
+    }
+
+    // 5. Keyword search fallback
+    if (filterKeyword.trim()) {
+      if (filteredParcels.length > 0) {
+        const p = filteredParcels[0];
+        const center = getWktCenter(p.geom);
+        map.flyTo({
+          center: [center[0], center[1]],
+          zoom: 16.5,
+          duration: 2200,
+          speed: 0.75,
+          curve: 1.42,
+          essential: true,
+          easing: (t) => 1 - Math.pow(1 - t, 3)
+        });
+        setSelectedFeature({ type: 'Parcel', name: p.parcelId, data: p });
+        setSearchFeedback({
+          message: `Found ${filteredParcels.length} match(es) for "${filterKeyword}". Focused on ${p.parcelId}.`,
+          type: 'success'
+        });
+        setSearchBannerOpen(false);
+      } else {
+        setSearchFeedback({
+          message: `No matches found for "${filterKeyword}".`,
+          type: 'warning'
+        });
       }
     }
   };
@@ -1256,9 +1469,13 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     setFilterEstateId('');
     setFilterPlotStatus('');
     setFilterParcelId('');
+    setFilterKeyword('');
     setSelectedFeature(null);
-    setIsBeeping(false);
+    setSearchFeedback(null);
     useStore.setState({ spatialQueryResults: [] });
+    if (mapInstanceRef.current) {
+      fitToActiveLayerBounds(mapInstanceRef.current);
+    }
   };
 
   // Locate current position mock or browser API
@@ -1584,115 +1801,338 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
           </button>
         )}
 
-        {/* TOP FLOATING SEARCH LANDBANK CONTROL */}
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center pointer-events-auto max-w-3xl w-[92%] sm:w-auto">
+        {/* TOP FLOATING SLEEK SEARCH LANDBANK CONTROL (GLASSMORPHIC & NON-INTRUSIVE) */}
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 w-[96%] max-w-4xl flex flex-col items-center pointer-events-auto select-none">
           
-          {/* Collapsible compact pill button */}
-          <button
-            onClick={() => setSearchBannerOpen(!searchBannerOpen)}
-            className="bg-slate-950/90 hover:bg-gov-blue text-white text-xs font-black px-5 py-2.5 rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-2.5 tracking-wide transition-all duration-200 hover:scale-105 active:scale-95"
-            title="Toggle Search Landbank Tools"
-          >
-            <Search className="w-4 h-4 text-gov-blue" />
-            <span className="uppercase text-[11px]">Search Landbank</span>
-            <span className="text-[10px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded-full">{searchBannerOpen ? '▲ Close' : '▼ Expand'}</span>
-          </button>
-
-          {/* Compact Popup Card Overlay */}
-          {searchBannerOpen && (
-            <div className="mt-2 w-full max-w-3xl bg-slate-950/95 backdrop-blur-md border border-slate-700 shadow-2xl rounded-2xl overflow-hidden flex flex-col text-xs text-slate-200 animate-in zoom-in-95 duration-150">
-              
-              {/* Header Bar with Close Button */}
-              <div className="px-4 py-2.5 bg-slate-900 border-b border-slate-800 flex justify-between items-center">
-                <div className="flex items-center gap-2 font-black text-slate-200 uppercase tracking-wider text-[11px]">
-                  <Search className="w-3.5 h-3.5 text-gov-blue" />
-                  <span>Landbank Spatial Search Engine</span>
-                </div>
+          {/* Main Floating Compact Ribbon */}
+          <div className="bg-slate-950/85 hover:bg-slate-950/95 backdrop-blur-xl border border-slate-700/60 shadow-2xl rounded-2xl p-2 px-3 flex flex-wrap md:flex-nowrap items-center justify-between gap-2.5 transition-all duration-200 w-full">
+            
+            {/* Quick Text / Keyword Search */}
+            <div className="relative flex items-center flex-1 min-w-[200px] max-w-md">
+              <Search className="absolute left-2.5 w-4 h-4 text-gov-blue pointer-events-none" />
+              <input
+                type="text"
+                value={filterKeyword}
+                placeholder="Search plot number, parcel ID, estate..."
+                onChange={(e) => {
+                  setFilterKeyword(e.target.value);
+                  setSearchFeedback(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleSearchIE();
+                }}
+                className="w-full pl-8 pr-7 py-1.5 bg-slate-900/90 border border-slate-700/70 rounded-xl text-xs text-slate-100 placeholder-slate-400 focus:outline-none focus:border-gov-blue focus:ring-1 focus:ring-gov-blue/40 font-medium transition"
+              />
+              {filterKeyword && (
                 <button
-                  onClick={() => setSearchBannerOpen(false)}
-                  className="text-slate-400 hover:text-white p-1 rounded hover:bg-slate-800 transition"
-                  title="Close Search Tools"
+                  onClick={() => setFilterKeyword('')}
+                  className="absolute right-2 text-slate-400 hover:text-white p-0.5 rounded transition"
+                  title="Clear text"
                 >
-                  ✕
+                  <X className="w-3.5 h-3.5" />
                 </button>
-              </div>
+              )}
+            </div>
 
-              {/* Sub-header title bar */}
-              <div className="px-4 py-2 bg-slate-900/90 border-b border-slate-800 flex items-center gap-2 text-[11px] font-black text-gov-blue uppercase tracking-wider">
+            {/* Quick Status Filter Chips with Colored Jumping Indicators */}
+            <div className="flex items-center gap-1 overflow-x-auto py-0.5 max-w-full text-[11px] font-semibold">
+              <button
+                onClick={() => handleQuickStatusClick('')}
+                className={`px-2.5 py-1 rounded-lg transition-all duration-150 flex items-center gap-1 cursor-pointer ${
+                  filterPlotStatus === '' 
+                    ? 'bg-gov-blue text-white shadow-xs font-bold' 
+                    : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
+                title="Show all plots"
+              >
+                <span>All</span>
+                <span className="text-[9px] opacity-75">({statusCounts.all})</span>
+              </button>
+
+              <button
+                onClick={() => handleQuickStatusClick('Vacan')}
+                className={`px-2.5 py-1 rounded-lg transition-all duration-150 flex items-center gap-1.5 cursor-pointer ${
+                  filterPlotStatus === 'Vacan' 
+                    ? 'bg-emerald-600 text-white shadow-xs font-bold ring-2 ring-emerald-400/50' 
+                    : 'bg-slate-900/80 hover:bg-slate-800 text-emerald-400 border border-slate-800'
+                }`}
+                title="Filter Vacant Plots (Spawns Green Jumping Markers)"
+              >
+                <span className={`w-2 h-2 rounded-full bg-emerald-400 ${filterPlotStatus === 'Vacan' ? 'animate-ping' : ''}`}></span>
+                <span>Vacan</span>
+                <span className="text-[9px] opacity-75 font-bold">({statusCounts.vacan})</span>
+              </button>
+
+              <button
+                onClick={() => handleQuickStatusClick('Occupied')}
+                className={`px-2.5 py-1 rounded-lg transition-all duration-150 flex items-center gap-1.5 cursor-pointer ${
+                  filterPlotStatus === 'Occupied' 
+                    ? 'bg-rose-600 text-white shadow-xs font-bold ring-2 ring-rose-400/50' 
+                    : 'bg-slate-900/80 hover:bg-slate-800 text-rose-400 border border-slate-800'
+                }`}
+                title="Filter Occupied Plots (Spawns Red Jumping Markers)"
+              >
+                <span className={`w-2 h-2 rounded-full bg-rose-400 ${filterPlotStatus === 'Occupied' ? 'animate-ping' : ''}`}></span>
+                <span>Occupied</span>
+                <span className="text-[9px] opacity-75 font-bold">({statusCounts.occupied})</span>
+              </button>
+
+              <button
+                onClick={() => handleQuickStatusClick('Doubtful')}
+                className={`px-2.5 py-1 rounded-lg transition-all duration-150 flex items-center gap-1.5 cursor-pointer ${
+                  filterPlotStatus === 'Doubtful' 
+                    ? 'bg-yellow-600 text-white shadow-xs font-bold ring-2 ring-yellow-400/50' 
+                    : 'bg-slate-900/80 hover:bg-slate-800 text-yellow-400 border border-slate-800'
+                }`}
+                title="Filter Doubtful Plots (Spawns Yellow Jumping Markers)"
+              >
+                <span className={`w-2 h-2 rounded-full bg-yellow-400 ${filterPlotStatus === 'Doubtful' ? 'animate-ping' : ''}`}></span>
+                <span>Doubtful</span>
+                <span className="text-[9px] opacity-75 font-bold">({statusCounts.doubtful})</span>
+              </button>
+            </div>
+
+            {/* Actions: Advanced Filters Toggle & Search / Reset */}
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <button
+                onClick={() => setSearchBannerOpen(!searchBannerOpen)}
+                className={`px-2.5 py-1.5 rounded-xl text-xs font-bold border flex items-center gap-1.5 transition-all duration-150 cursor-pointer ${
+                  searchBannerOpen || activeFiltersCount > 0
+                    ? 'bg-gov-blue text-white border-gov-blue shadow-xs'
+                    : 'bg-slate-900/90 text-slate-300 border-slate-700/80 hover:bg-slate-800 hover:text-white'
+                }`}
+                title="Toggle Advanced Cascading Filters"
+              >
+                <Filter className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Filters</span>
+                {activeFiltersCount > 0 && (
+                  <span className="w-4 h-4 bg-white text-gov-blue rounded-full text-[10px] font-black flex items-center justify-center">
+                    {activeFiltersCount}
+                  </span>
+                )}
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${searchBannerOpen ? 'rotate-180' : ''}`} />
+              </button>
+
+              <button
+                onClick={handleSearchIE}
+                className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold px-3.5 py-1.5 rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-emerald-950/40 transition active:scale-95 cursor-pointer"
+                title="Search and Locate on Map"
+              >
                 <Search className="w-3.5 h-3.5" />
-                <span>Search by Estate & Plot</span>
+                <span>Search</span>
+              </button>
+
+              {(activeFiltersCount > 0 || searchFeedback) && (
+                <button
+                  onClick={resetFilters}
+                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-bold p-1.5 rounded-xl text-xs border border-slate-700 transition active:scale-95 cursor-pointer"
+                  title="Reset all filters and camera view"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Advanced Cascading Filter Drawer (Opens neatly under ribbon) */}
+          {searchBannerOpen && (
+            <div className="mt-2 w-full bg-slate-950/95 backdrop-blur-2xl border border-slate-700/80 shadow-2xl rounded-2xl p-3.5 space-y-3 animate-in zoom-in-95 duration-150 text-xs text-slate-200">
+              
+              {/* Drawer Top Bar */}
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 bg-gov-blue/20 text-gov-blue rounded-lg">
+                    <Building2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="font-extrabold text-xs text-white uppercase tracking-wider">Spatial Landbank Filter Engine</h4>
+                    <p className="text-[10px] text-slate-400">Cascading selection across administrative boundaries, industrial estates, and plots.</p>
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 bg-gov-blue/20 text-gov-blue border border-gov-blue/30 rounded-full text-[10px] font-bold">
+                    {filteredParcels.length} plot{filteredParcels.length !== 1 ? 's' : ''} available
+                  </span>
+                  <button
+                    onClick={() => setSearchBannerOpen(false)}
+                    className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
+                    title="Minimize Drawer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
 
-              {/* Search by Estate & Plot Form Area */}
-              <div className="p-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3 items-end bg-slate-950 border-t border-slate-800/80">
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">District</label>
+              {/* 4-Column Cascading Select Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                {/* 1. District Boundary */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    <Building2 className="w-3 h-3 text-gov-blue" />
+                    <span>District</span>
+                  </label>
                   <select 
-                    value={filterDistrictId} onChange={(e) => setFilterDistrictId(e.target.value)}
-                    className="w-full p-2.5 bg-slate-900/90 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition-all"
+                    value={filterDistrictId} 
+                    onChange={(e) => {
+                      setFilterDistrictId(e.target.value);
+                      setFilterEstateId('');
+                      setFilterParcelId('');
+                      setSelectedFeature(null);
+                      setSearchFeedback(null);
+                    }}
+                    className="w-full p-2 bg-slate-900 border border-slate-700/80 rounded-xl text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition"
                   >
                     <option value="">-- All Districts --</option>
                     {districts.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
                   </select>
                 </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Industrial Estate</label>
+                {/* 2. Industrial Estate */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    <Compass className="w-3 h-3 text-gov-blue" />
+                    <span>Industrial Estate</span>
+                  </label>
                   <select 
-                    value={filterEstateId} onChange={(e) => setFilterEstateId(e.target.value)}
-                    className="w-full p-2.5 bg-slate-900/90 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition-all"
+                    value={filterEstateId} 
+                    onChange={(e) => {
+                      setFilterEstateId(e.target.value);
+                      setFilterParcelId('');
+                      setSelectedFeature(null);
+                      setSearchFeedback(null);
+                    }}
+                    className="w-full p-2 bg-slate-900 border border-slate-700/80 rounded-xl text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition"
                   >
-                    <option value="">-- All Estates --</option>
-                    {filteredEstates.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                    <option value="">-- All Estates ({filteredEstates.length}) --</option>
+                    {filteredEstates.map(e => (
+                      <option key={e.id} value={e.id}>
+                        {e.name}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Plot Status</label>
+                {/* 3. Plot Status Category */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    <Filter className="w-3 h-3 text-gov-blue" />
+                    <span>Plot Status</span>
+                  </label>
                   <select 
-                    value={filterPlotStatus} onChange={(e) => setFilterPlotStatus(e.target.value)}
-                    className="w-full p-2.5 bg-slate-900/90 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition-all"
+                    value={filterPlotStatus} 
+                    onChange={(e) => {
+                      setFilterPlotStatus(e.target.value);
+                      setFilterParcelId('');
+                      setSelectedFeature(null);
+                      setSearchFeedback(null);
+                    }}
+                    className="w-full p-2 bg-slate-900 border border-slate-700/80 rounded-xl text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition"
                   >
-                    <option value="">-- All Statuses --</option>
-                    <option value="Vacan">Vacan</option>
-                    <option value="Occupied">Occupied</option>
-                    <option value="Doubtful">Doubtful</option>
-                    <option value="Inner Road">Inner Road</option>
+                    <option value="">-- All Statuses ({statusCounts.all}) --</option>
+                    <option value="Vacan">🟢 Vacan ({statusCounts.vacan})</option>
+                    <option value="Occupied">🔴 Occupied ({statusCounts.occupied})</option>
+                    <option value="Doubtful">🟡 Doubtful ({statusCounts.doubtful})</option>
+                    <option value="Inner Road">⚪ Inner Road ({statusCounts.road})</option>
                   </select>
                 </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Select Plot</label>
+                {/* 4. Select Plot Number / Parcel ID */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    <MapPin className="w-3 h-3 text-gov-blue" />
+                    <span>Select Plot ({filteredParcels.length})</span>
+                  </label>
                   <select 
-                    value={filterParcelId} onChange={(e) => setFilterParcelId(e.target.value)}
-                    className="w-full p-2.5 bg-slate-900/90 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition-all"
+                    value={filterParcelId} 
+                    onChange={(e) => {
+                      const newId = e.target.value;
+                      setFilterParcelId(newId);
+                      if (newId) {
+                        const target = parcels.find(x => x.id === Number(newId));
+                        if (target && !filterEstateId) {
+                          setFilterEstateId(target.estateId.toString());
+                        }
+                      }
+                      setSearchFeedback(null);
+                    }}
+                    className="w-full p-2 bg-slate-900 border border-slate-700/80 rounded-xl text-slate-200 focus:outline-none focus:border-gov-blue focus:ring-2 focus:ring-gov-blue/30 text-xs font-semibold shadow-xs transition"
                   >
-                    <option value="">-- Select Plot --</option>
-                    {filteredParcelsByStatus.map(p => (
+                    <option value="">-- Pinpoint Specific Plot --</option>
+                    {filteredParcels.map(p => (
                       <option key={p.id} value={p.id}>
                         {p.parcelId} ({p.plotNumber}) - [{p.availabilityStatus}]
                       </option>
                     ))}
                   </select>
                 </div>
+              </div>
 
-                <div className="flex gap-2">
+              {/* Drawer Action Bar */}
+              <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px] text-slate-400">
+                  {filterEstateId && (
+                    <span>
+                      Estate: <strong className="text-slate-200">{estates.find(e => e.id === Number(filterEstateId))?.name}</strong> • 
+                    </span>
+                  )}
+                  {filterPlotStatus && (
+                    <span className="ml-1">
+                      Status: <strong className="text-slate-200">{filterPlotStatus}</strong> • 
+                    </span>
+                  )}
+                  <span className="ml-1 text-gov-blue font-bold">{filteredParcels.length} matching plot(s)</span>
+                </div>
+
+                <div className="flex items-center gap-2">
                   <button
-                    onClick={handleSearchIE}
-                    className="flex-1 bg-emerald-600 hover:bg-emerald-500 active:scale-98 text-white font-extrabold py-2.5 px-3 rounded-lg transition-all duration-200 text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-900/30 cursor-pointer"
+                    onClick={() => setSearchBannerOpen(false)}
+                    className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs font-semibold border border-slate-800 transition"
                   >
-                    <Search className="w-3.5 h-3.5" /> Search
+                    Minimize & View Map
                   </button>
                   <button
                     onClick={resetFilters}
-                    className="flex-1 bg-slate-800 hover:bg-slate-700 active:scale-98 text-slate-300 hover:text-white font-bold py-2.5 px-3 rounded-lg transition-all duration-200 text-xs text-center border border-slate-700 hover:border-slate-600 shadow-sm cursor-pointer"
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-semibold border border-slate-700 transition"
                   >
                     Reset
                   </button>
+                  <button
+                    onClick={handleSearchIE}
+                    className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-emerald-950/40 transition active:scale-95 cursor-pointer"
+                  >
+                    <Search className="w-3.5 h-3.5" />
+                    <span>Search & Pinpoint</span>
+                  </button>
                 </div>
               </div>
+
             </div>
           )}
+
+          {/* Interactive Search Feedback Pill / Toast */}
+          {searchFeedback && (
+            <div className={`mt-2 px-4 py-2 rounded-full text-xs font-bold flex items-center gap-2 shadow-2xl backdrop-blur-md border animate-in slide-in-from-top-2 duration-200 pointer-events-auto ${
+              searchFeedback.type === 'success' 
+                ? 'bg-emerald-950/90 text-emerald-200 border-emerald-700/80 shadow-emerald-950/40' :
+              searchFeedback.type === 'warning'
+                ? 'bg-yellow-950/90 text-yellow-200 border-yellow-700/80 shadow-yellow-950/40' :
+                'bg-sky-950/90 text-sky-200 border-sky-700/80 shadow-sky-950/40'
+            }`}>
+              {searchFeedback.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />}
+              {searchFeedback.type === 'warning' && <AlertCircle className="w-4 h-4 text-yellow-400 flex-shrink-0" />}
+              {searchFeedback.type === 'info' && <Info className="w-4 h-4 text-sky-400 flex-shrink-0" />}
+              <span className="truncate max-w-md">{searchFeedback.message}</span>
+              <button
+                onClick={() => setSearchFeedback(null)}
+                className="ml-1 text-slate-400 hover:text-white p-0.5 rounded transition"
+                title="Dismiss"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
         </div>
 
         {/* FLOATING ACTION MESSAGES */}
@@ -1868,17 +2308,6 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
                   }}
                 />
               ))}
-
-              {/* 4. Highlighted Selected Parcel with Beeping vibrant color (SVG) */}
-              {selectedFeature && selectedFeature.data && selectedFeature.data.geom && (
-                <polygon
-                  points={toSvgCoords(selectedFeature.data.geom)}
-                  fill={isBeeping ? "#ff0055" : "rgba(14, 165, 233, 0.25)"}
-                  stroke={isBeeping ? "#ff0055" : "#0ea5e9"}
-                  strokeWidth={isBeeping ? "4" : "3.5"}
-                  className={`${isBeeping ? 'animate-beep-highlight' : ''} pointer-events-none`}
-                />
-              )}
 
               {/* 5. Highlighted query results with blue/sky (SVG) */}
               {spatialQueryResults.map(res => (
