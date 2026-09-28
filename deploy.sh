@@ -133,17 +133,23 @@ echo -e "${GREEN}[✓] Database migrations and dataset seeding completed.${NC}\n
 echo -e "${CYAN}[6/6] Verifying running services...${NC}"
 $COMPOSE_CMD ps
 
-# Detect Server IP
+# Detect Server IP and Port
 SERVER_IP=$(curl -s -4 ifconfig.me || curl -s -4 icanhazip.com || hostname -I | awk '{print $1}')
+HTTP_PORT_VAL=$(grep -E '^HTTP_PORT=' .env 2>/dev/null | cut -d '=' -f2 | tr -d ' ' || echo "80")
+if [ -z "$HTTP_PORT_VAL" ] || [ "$HTTP_PORT_VAL" = "80" ]; then
+  PORT_SUFFIX=""
+else
+  PORT_SUFFIX=":${HTTP_PORT_VAL}"
+fi
 
 echo -e "\n${GREEN}${BOLD}======================================================================${NC}"
 echo -e "${GREEN}${BOLD}   🚀 DEPLOYMENT SUCCESSFUL! GIS PORTAL IS LIVE!   ${NC}"
 echo -e "${GREEN}${BOLD}======================================================================${NC}"
 echo -e "${BOLD}Access Endpoints:${NC}"
-echo -e "  🌐 Web Application:   ${CYAN}http://${SERVER_IP}/${NC}"
-echo -e "  📊 REST API Stats:     ${CYAN}http://${SERVER_IP}/api/dashboard/stats/${NC}"
-echo -e "  🗺️  OGC WMS Service:    ${CYAN}http://${SERVER_IP}/ogc/?service=WMS&version=1.3.0&request=GetCapabilities${NC}"
-echo -e "  📦 OGC WFS Service:    ${CYAN}http://${SERVER_IP}/ogc/?service=WFS&version=2.0.0&request=GetCapabilities${NC}"
+echo -e "  🌐 Web Application:   ${CYAN}http://${SERVER_IP}${PORT_SUFFIX}/${NC}"
+echo -e "  📊 REST API Stats:     ${CYAN}http://${SERVER_IP}${PORT_SUFFIX}/api/dashboard/stats/${NC}"
+echo -e "  🗺️  OGC WMS Service:    ${CYAN}http://${SERVER_IP}${PORT_SUFFIX}/ogc/?service=WMS&version=1.3.0&request=GetCapabilities${NC}"
+echo -e "  📦 OGC WFS Service:    ${CYAN}http://${SERVER_IP}${PORT_SUFFIX}/ogc/?service=WFS&version=2.0.0&request=GetCapabilities${NC}"
 echo -e "\n${BOLD}Default Admin Credentials:${NC}"
 echo -e "  Username: ${YELLOW}gisadmin${NC}"
 echo -e "  Password: ${YELLOW}gisadmin${NC}"
