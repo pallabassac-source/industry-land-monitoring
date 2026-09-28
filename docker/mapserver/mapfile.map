@@ -1,0 +1,102 @@
+MAP
+  NAME "INDUSTRIAL_LAND_BANK_MAP"
+  STATUS ON
+  SIZE 800 600
+  EXTENT 89.0 24.0 97.0 29.0 # Bounds for Assam region
+  UNITS DD
+  SHAPEPATH "/app/mediafiles"
+  IMAGECOLOR 255 255 255
+  PROJECTION
+    "init=epsg:4326"
+  END
+
+  WEB
+    METADATA
+      "wms_title"         "Industrial Land Bank Map Services"
+      "wms_onlineresource" "http://localhost/ogc/?"
+      "wms_srs"           "EPSG:4326 EPSG:3857 EPSG:32643 EPSG:32644"
+      "wms_enable_request" "*"
+      "wfs_title"         "Industrial Land Bank Feature Services"
+      "wfs_onlineresource" "http://localhost/ogc/?"
+      "wfs_srs"           "EPSG:4326 EPSG:3857"
+      "wfs_enable_request" "*"
+    END
+  END
+
+  # Industrial Estates OGC Layer
+  LAYER
+    NAME "estates"
+    STATUS ON
+    TYPE POLYGON
+    CONNECTIONTYPE POSTGIS
+    CONNECTION "host=db port=5432 dbname=industrial_land_bank user=gis_admin password=gis_secure_password_2026 sslmode=disable"
+    DATA "geom FROM industrial_estates USING UNIQUE id USING SRID=4326"
+    METADATA
+      "wms_title" "Industrial Estates"
+      "wfs_title" "Industrial Estates"
+      "gml_include_items" "all"
+    END
+    PROJECTION
+      "init=epsg:4326"
+    END
+    CLASS
+      NAME "Industrial Estate"
+      STYLE
+        COLOR 173 216 230 # Light Blue
+        OUTLINECOLOR 0 0 139 # Dark Blue
+        WIDTH 2
+      END
+    END
+  END
+
+  # Land Parcels OGC Layer
+  LAYER
+    NAME "parcels"
+    STATUS ON
+    TYPE POLYGON
+    CONNECTIONTYPE POSTGIS
+    CONNECTION "host=db port=5432 dbname=industrial_land_bank user=gis_admin password=gis_secure_password_2026 sslmode=disable"
+    DATA "geom FROM land_parcels USING UNIQUE id USING SRID=4326"
+    METADATA
+      "wms_title" "Land Parcels"
+      "wfs_title" "Land Parcels"
+      "gml_include_items" "all"
+    END
+    PROJECTION
+      "init=epsg:4326"
+    END
+    CLASS
+      NAME "Land Parcel"
+      STYLE
+        COLOR 144 238 144 # Light Green
+        OUTLINECOLOR 34 139 34 # Forest Green
+        WIDTH 1
+      END
+    END
+  END
+
+  # Infrastructure GIS Layer (Lines)
+  LAYER
+    NAME "infrastructure"
+    STATUS ON
+    TYPE LINE
+    CONNECTIONTYPE POSTGIS
+    CONNECTION "host=db port=5432 dbname=industrial_land_bank user=gis_admin password=gis_secure_password_2026 sslmode=disable"
+    DATA "geom FROM infrastructure_layers USING UNIQUE id USING SRID=4326"
+    METADATA
+      "wms_title" "Infrastructure Networks"
+      "wfs_title" "Infrastructure Networks"
+      "gml_include_items" "all"
+    END
+    PROJECTION
+      "init=epsg:4326"
+    END
+    CLASS
+      NAME "Infrastructure Line"
+      STYLE
+        COLOR 255 165 0 # Orange
+        WIDTH 2
+      END
+    END
+  END
+END

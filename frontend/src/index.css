@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* Custom scrollbars for clean enterprise UI grid layout */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Beeping Highlight pulse animation for map search targets */
+@keyframes beepPulse {
+  0%, 100% {
+    fill: #ff0055;
+    fill-opacity: 0.25;
+    stroke: #ff0055;
+    stroke-width: 2px;
+  }
+  50% {
+    fill: #ff0055;
+    fill-opacity: 0.95;
+    stroke: #ff0055;
+    stroke-width: 6px;
+    filter: drop-shadow(0 0 12px #ff0055);
+  }
+}
+
+.animate-beep-highlight {
+  animation: beepPulse 0.5s infinite ease-in-out;
+}
+

@@ -1,0 +1,130 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: gis_portal_db
+    environment:
+      POSTGRES_DB: industrial_land_bank
+      POSTGRES_USER: gis_admin
+      POSTGRES_PASSWORD: gis_secure_password_2026
+    ports:
+      - "5435:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init_postgis.sql:/docker-entrypoint-initdb.d/init_postgis.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gis_admin -d industrial_land_bank"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gis_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: gis_portal_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - gis_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gis_portal_backend
+    command: gunicorn backend.wsgi:application --bind 0.0.0.0:8000 --workers 3
+    environment:
+      - DATABASE_URL=postgres://gis_admin:gis_secure_password_2026@db:5432/industrial_land_bank
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=backend.settings
+      - SECRET_KEY=django-secure-gis-secret-key-prd-v1
+      - DEBUG=False
+    volumes:
+      - ./backend:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/mediafiles
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - gis_network
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gis_portal_celery
+    command: celery -A backend worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgres://gis_admin:gis_secure_password_2026@db:5432/industrial_land_bank
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=backend.settings
+    volumes:
+      - ./backend:/app
+      - media_volume:/app/mediafiles
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - gis_network
+
+  mapserver:
+    image: camptocamp/mapserver:8.0
+    container_name: gis_portal_mapserver
+    ports:
+      - "8080:80"
+    environment:
+      - MS_MAPFILE=/etc/mapserver/mapfile.map
+      - PGSERVICEFILE=/etc/mapserver/pg_service.conf
+    volumes:
+      - ./docker/mapserver:/etc/mapserver:ro
+      - media_volume:/app/mediafiles:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - gis_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gis_portal_frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    networks:
+      - gis_network
+
+  nginx:
+    image: nginx:alpine
+    container_name: gis_portal_nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/usr/share/nginx/html/static:ro
+      - media_volume:/usr/share/nginx/html/media:ro
+    depends_on:
+      - backend
+      - mapserver
+      - frontend
+    networks:
+      - gis_network
+
+volumes:
+  pgdata:
+  static_volume:
+  media_volume:
+
+networks:
+  gis_network:
+    driver: bridge
