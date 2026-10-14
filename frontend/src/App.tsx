@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useStore } from './store/useStore.ts';
 import MapView from './components/MapView.tsx';
+import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import DashboardView from './views/DashboardView.tsx';
 import InventoryView from './views/InventoryView.tsx';
 import LayersView from './views/LayersView.tsx';
@@ -21,13 +22,22 @@ const extractWktCenter = (wkt: any): [number, number] => {
         if (Array.isArray(arr[0])) {
           arr.forEach(extractCoords);
         } else if (typeof arr[0] === 'number' && typeof arr[1] === 'number') {
-          sumLng += arr[0];
-          sumLat += arr[1];
-          count++;
+          const [lng, lat] = arr;
+          if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+            sumLng += lng;
+            sumLat += lat;
+            count++;
+          }
         }
       };
       extractCoords(wkt.coordinates);
-      if (count > 0) return [sumLng / count, sumLat / count];
+      if (count > 0) {
+        const avgLng = sumLng / count;
+        const avgLat = sumLat / count;
+        if (avgLat >= -90 && avgLat <= 90 && avgLng >= -180 && avgLng <= 180) {
+          return [avgLng, avgLat];
+        }
+      }
     } catch (e) {}
   }
   if (typeof wkt === 'string') {
@@ -38,14 +48,20 @@ const extractWktCenter = (wkt: any): [number, number] => {
         const clean = ring.replace(/[\(\)]/g, '').trim();
         clean.split(',').forEach(pair => {
           const [lng, lat] = pair.trim().split(/\s+/).map(Number);
-          if (!isNaN(lng) && !isNaN(lat)) {
+          if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
             sumLng += lng;
             sumLat += lat;
             count++;
           }
         });
       });
-      if (count > 0) return [sumLng / count, sumLat / count];
+      if (count > 0) {
+        const avgLng = sumLng / count;
+        const avgLat = sumLat / count;
+        if (avgLat >= -90 && avgLat <= 90 && avgLng >= -180 && avgLng <= 180) {
+          return [avgLng, avgLat];
+        }
+      }
     }
   }
   return [91.76, 26.18];
@@ -443,7 +459,9 @@ export default function App() {
           {/* GIS Map Workspace: Kept mounted in background so WebGL context & tile cache are never destroyed */}
           <div className={`w-full h-full ${activeTab === 'map' ? 'flex' : 'hidden'}`}>
             <div className={`transition-all duration-300 ${isMapExpanded ? 'w-full' : 'w-1/2'} h-full`}>
-              <MapView isMapExpanded={isMapExpanded} onToggleSplitScreen={() => setIsMapExpanded(!isMapExpanded)} />
+              <ErrorBoundary fallbackTitle="Interactive GIS Map Engine Protected">
+                <MapView isMapExpanded={isMapExpanded} onToggleSplitScreen={() => setIsMapExpanded(!isMapExpanded)} />
+              </ErrorBoundary>
             </div>
             {/* Side-by-side Inventory Comparison panel */}
             {!isMapExpanded && (

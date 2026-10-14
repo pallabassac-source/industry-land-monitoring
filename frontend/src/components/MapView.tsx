@@ -111,14 +111,21 @@ const getWktCenter = (wkt: any): [number, number] => {
       if (Array.isArray(arr[0])) {
         arr.forEach(extractCoords);
       } else if (typeof arr[0] === 'number' && typeof arr[1] === 'number') {
-        sumLng += arr[0];
-        sumLat += arr[1];
-        count++;
+        const [lng, lat] = arr;
+        if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+          sumLng += lng;
+          sumLat += lat;
+          count++;
+        }
       }
     };
     extractCoords(geojson.coordinates);
     if (count > 0) {
-      return [sumLng / count, sumLat / count];
+      const avgLng = sumLng / count;
+      const avgLat = sumLat / count;
+      if (avgLat >= -90 && avgLat <= 90 && avgLng >= -180 && avgLng <= 180) {
+        return [avgLng, avgLat];
+      }
     }
   } catch (e) {}
   return [91.76, 26.18];
@@ -826,7 +833,8 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
         coords.forEach(extractCoords);
       } else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
         const [lng, lat] = coords;
-        if (!isNaN(lng) && !isNaN(lat)) {
+        // Strictly validate valid geographical latitude [-90, 90] and longitude [-180, 180]
+        if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
           if (lng < minLng) minLng = lng;
           if (lat < minLat) minLat = lat;
           if (lng > maxLng) maxLng = lng;
@@ -837,21 +845,31 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
 
     validFeatures.forEach(f => extractCoords(f.geometry.coordinates));
 
-    if (minLng !== Infinity && maxLng !== -Infinity && (maxLng - minLng > 0.0001 || maxLat - minLat > 0.0001)) {
-      map.fitBounds(
-        [[minLng, minLat], [maxLng, maxLat]],
-        { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
-      );
-    } else if (minLng !== Infinity) {
-      map.flyTo({
-        center: [minLng, minLat],
-        zoom: 15.5,
-        duration: 2200,
-        speed: 0.75,
-        curve: 1.42,
-        essential: true,
-        easing: (t) => 1 - Math.pow(1 - t, 3)
-      });
+    if (minLng !== Infinity && maxLng !== -Infinity && 
+        minLat >= -90 && maxLat <= 90 && minLng >= -180 && maxLng <= 180 &&
+        (maxLng - minLng > 0.0001 || maxLat - minLat > 0.0001)) {
+      try {
+        map.fitBounds(
+          [[minLng, minLat], [maxLng, maxLat]],
+          { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+        );
+      } catch (err) {
+        console.warn('fitToActiveLayerBounds fitBounds warning:', err);
+      }
+    } else if (minLng !== Infinity && minLat >= -90 && minLat <= 90 && minLng >= -180 && minLng <= 180) {
+      try {
+        map.flyTo({
+          center: [minLng, minLat],
+          zoom: 15.5,
+          duration: 2200,
+          speed: 0.75,
+          curve: 1.42,
+          essential: true,
+          easing: (t) => 1 - Math.pow(1 - t, 3)
+        });
+      } catch (err) {
+        console.warn('fitToActiveLayerBounds flyTo warning:', err);
+      }
     }
   };
 
@@ -861,6 +879,7 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     const bounds = targetLayer.bounds;
     if (!bounds || bounds.length !== 4) return;
     const [minLng, minLat, maxLng, maxLat] = bounds;
+    if (minLat < -85.05 || maxLat > 85.05 || minLng < -180 || maxLng > 180 || minLat > maxLat || minLng > maxLng) return;
     const baseUrl = targetLayer.tile_url_pattern.startsWith('http')
       ? targetLayer.tile_url_pattern
       : `${window.location.origin}${targetLayer.tile_url_pattern}`;
@@ -901,7 +920,7 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
         c.forEach(scanCoords);
       } else if (typeof c[0] === 'number' && typeof c[1] === 'number') {
         const [lng, lat] = c;
-        if (!isNaN(lng) && !isNaN(lat)) {
+        if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
           if (lng < minLng) minLng = lng;
           if (lat < minLat) minLat = lat;
           if (lng > maxLng) maxLng = lng;
@@ -924,21 +943,30 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
 
     // Fallback to bounding box array [minLng, minLat, maxLng, maxLat]
     if (minLng === Infinity && targetLayer.bounds && targetLayer.bounds.length === 4) {
-      [minLng, minLat, maxLng, maxLat] = targetLayer.bounds;
+      const [bMinLng, bMinLat, bMaxLng, bMaxLat] = targetLayer.bounds;
+      if (bMinLat >= -90 && bMaxLat <= 90 && bMinLng >= -180 && bMaxLng <= 180 && bMinLat <= bMaxLat && bMinLng <= bMaxLng) {
+        [minLng, minLat, maxLng, maxLat] = targetLayer.bounds;
+      }
     }
 
-    if (minLng !== Infinity && maxLng !== -Infinity && (maxLng - minLng > 0.0001 || maxLat - minLat > 0.0001)) {
-      const currentBounds = map.getBounds();
-      const currentZoom = map.getZoom();
-      // If camera is already looking at this survey extent, skip redundant re-animation
-      const isAlreadyInView = currentBounds.getWest() <= minLng && currentBounds.getEast() >= maxLng &&
-                              currentBounds.getSouth() <= minLat && currentBounds.getNorth() >= maxLat &&
-                              currentZoom >= 13.5;
-      if (!isAlreadyInView) {
-        map.fitBounds(
-          [[minLng, minLat], [maxLng, maxLat]],
-          { padding: 75, maxZoom: 17.5, duration: 600, essential: true, easing: (t) => 1 - Math.pow(1 - t, 3) }
-        );
+    if (minLng !== Infinity && maxLng !== -Infinity &&
+        minLat >= -90 && maxLat <= 90 && minLng >= -180 && maxLng <= 180 &&
+        (maxLng - minLng > 0.0001 || maxLat - minLat > 0.0001)) {
+      try {
+        const currentBounds = map.getBounds();
+        const currentZoom = map.getZoom();
+        // If camera is already looking at this survey extent, skip redundant re-animation
+        const isAlreadyInView = currentBounds.getWest() <= minLng && currentBounds.getEast() >= maxLng &&
+                                currentBounds.getSouth() <= minLat && currentBounds.getNorth() >= maxLat &&
+                                currentZoom >= 13.5;
+        if (!isAlreadyInView) {
+          map.fitBounds(
+            [[minLng, minLat], [maxLng, maxLat]],
+            { padding: 75, maxZoom: 17.5, duration: 600, essential: true, easing: (t) => 1 - Math.pow(1 - t, 3) }
+          );
+        }
+      } catch (err) {
+        console.warn('targetLayer fitBounds warning:', err);
       }
     }
   };
@@ -988,20 +1016,33 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
   useEffect(() => {
     if (!mapInstanceRef.current) return;
     const map = mapInstanceRef.current;
-    const currentCenter = map.getCenter();
-    const currentZoom = map.getZoom();
-    const distDiff = Math.abs(currentCenter.lng - mapCenter[0]) + Math.abs(currentCenter.lat - mapCenter[1]);
-    const zoomDiff = Math.abs(currentZoom - mapZoom);
-    if (distDiff > 0.0005 || zoomDiff > 0.1) {
-      map.flyTo({
-        center: [mapCenter[0], mapCenter[1]],
-        zoom: mapZoom,
-        duration: 2200,
-        speed: 0.75,
-        curve: 1.42,
-        essential: true,
-        easing: (t) => 1 - Math.pow(1 - t, 3)
-      });
+    if (!map.isStyleLoaded()) return;
+
+    if (!Array.isArray(mapCenter) || mapCenter.length < 2 ||
+        isNaN(mapCenter[0]) || isNaN(mapCenter[1]) ||
+        mapCenter[1] < -90 || mapCenter[1] > 90 || mapCenter[0] < -180 || mapCenter[0] > 180) {
+      console.warn('Ignored out-of-range mapCenter coordinates:', mapCenter);
+      return;
+    }
+
+    try {
+      const currentCenter = map.getCenter();
+      const currentZoom = map.getZoom();
+      const distDiff = Math.abs(currentCenter.lng - mapCenter[0]) + Math.abs(currentCenter.lat - mapCenter[1]);
+      const zoomDiff = Math.abs(currentZoom - mapZoom);
+      if (distDiff > 0.0005 || zoomDiff > 0.1) {
+        map.flyTo({
+          center: [mapCenter[0], mapCenter[1]],
+          zoom: mapZoom,
+          duration: 2200,
+          speed: 0.75,
+          curve: 1.42,
+          essential: true,
+          easing: (t) => 1 - Math.pow(1 - t, 3)
+        });
+      }
+    } catch (err) {
+      console.warn('mapCenter flyTo error:', err);
     }
   }, [mapCenter, mapZoom]);
 
@@ -1601,20 +1642,27 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
           if (Array.isArray(coords[0])) coords.forEach(extractCoords);
           else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
             const [lng, lat] = coords;
-            if (lng < minLng) minLng = lng;
-            if (lat < minLat) minLat = lat;
-            if (lng > maxLng) maxLng = lng;
-            if (lat > maxLat) maxLat = lat;
+            if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+              if (lng < minLng) minLng = lng;
+              if (lat < minLat) minLat = lat;
+              if (lng > maxLng) maxLng = lng;
+              if (lat > maxLat) maxLat = lat;
+            }
           }
         };
         extractCoords(g.coordinates);
       });
 
-      if (minLng !== Infinity && maxLng !== -Infinity) {
-        map.fitBounds(
-          [[minLng, minLat], [maxLng, maxLat]],
-          { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
-        );
+      if (minLng !== Infinity && maxLng !== -Infinity &&
+          minLat >= -90 && maxLat <= 90 && minLng >= -180 && maxLng <= 180) {
+        try {
+          map.fitBounds(
+            [[minLng, minLat], [maxLng, maxLat]],
+            { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+          );
+        } catch (err) {
+          console.warn('handleQuickStatusClick fitBounds warning:', err);
+        }
       }
     }
 
@@ -1697,20 +1745,27 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
           if (Array.isArray(coords[0])) coords.forEach(extractCoords);
           else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
             const [lng, lat] = coords;
-            if (lng < minLng) minLng = lng;
-            if (lat < minLat) minLat = lat;
-            if (lng > maxLng) maxLng = lng;
-            if (lat > maxLat) maxLat = lat;
+            if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+              if (lng < minLng) minLng = lng;
+              if (lat < minLat) minLat = lat;
+              if (lng > maxLng) maxLng = lng;
+              if (lat > maxLat) maxLat = lat;
+            }
           }
         };
         extractCoords(g.coordinates);
       });
 
-      if (minLng !== Infinity && maxLng !== -Infinity) {
-        map.fitBounds(
-          [[minLng, minLat], [maxLng, maxLat]],
-          { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
-        );
+      if (minLng !== Infinity && maxLng !== -Infinity &&
+          minLat >= -90 && maxLat <= 90 && minLng >= -180 && maxLng <= 180) {
+        try {
+          map.fitBounds(
+            [[minLng, minLat], [maxLng, maxLat]],
+            { padding: 90, maxZoom: 16.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+          );
+        } catch (err) {
+          console.warn('Matching search plots fitBounds error:', err);
+        }
       }
 
       const estName = filterEstateId ? (estates.find(e => e.id === Number(filterEstateId))?.name || 'Estate') : 'all estates';
@@ -1734,29 +1789,42 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
             if (Array.isArray(coords[0])) coords.forEach(extractCoords);
             else if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
               const [lng, lat] = coords;
-              if (lng < minLng) minLng = lng;
-              if (lat < minLat) minLat = lat;
-              if (lng > maxLng) maxLng = lng;
-              if (lat > maxLat) maxLat = lat;
+              if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+                if (lng < minLng) minLng = lng;
+                if (lat < minLat) minLat = lat;
+                if (lng > maxLng) maxLng = lng;
+                if (lat > maxLat) maxLat = lat;
+              }
             }
           };
           extractCoords(g.coordinates);
-          if (minLng !== Infinity && maxLng !== -Infinity) {
-            map.fitBounds(
-              [[minLng, minLat], [maxLng, maxLat]],
-              { padding: 90, maxZoom: 15.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
-            );
+          if (minLng !== Infinity && maxLng !== -Infinity &&
+              minLat >= -90 && maxLat <= 90 && minLng >= -180 && maxLng <= 180) {
+            try {
+              map.fitBounds(
+                [[minLng, minLat], [maxLng, maxLat]],
+                { padding: 90, maxZoom: 15.5, duration: 2200, easing: (t) => 1 - Math.pow(1 - t, 3) }
+              );
+            } catch (err) {
+              console.warn('Estate filter fitBounds error:', err);
+            }
           } else {
             const center = getWktCenter(e.geom);
-            map.flyTo({
-              center: [center[0], center[1]],
-              zoom: 15,
-              duration: 2200,
-              speed: 0.75,
-              curve: 1.42,
-              essential: true,
-              easing: (t) => 1 - Math.pow(1 - t, 3)
-            });
+            if (center[1] >= -90 && center[1] <= 90 && center[0] >= -180 && center[0] <= 180) {
+              try {
+                map.flyTo({
+                  center: [center[0], center[1]],
+                  zoom: 15,
+                  duration: 2200,
+                  speed: 0.75,
+                  curve: 1.42,
+                  essential: true,
+                  easing: (t) => 1 - Math.pow(1 - t, 3)
+                });
+              } catch (err) {
+                console.warn('Estate filter flyTo error:', err);
+              }
+            }
           }
         }
         setSelectedFeature({ type: 'Estate', name: e.name, data: e });

@@ -21,7 +21,7 @@ from .serializers import (
 from .utils_gis import (
     execute_spatial_query, validate_and_parse_spatial_file, 
     validate_and_parse_component_files, save_spatial_features_to_db, 
-    delete_layer_cascade
+    delete_layer_cascade, auto_repair_projected_geometries
 )
 from .tasks import dispatch_drone_tiling_job
 from .utils_drone import get_geotiff_metadata
@@ -188,6 +188,10 @@ class LandParcelListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        try:
+            auto_repair_projected_geometries()
+        except Exception:
+            pass
         estate_id = request.query_params.get('estate_id')
         status_filter = request.query_params.get('status')
         parcels = LandParcel.objects.all()
@@ -260,6 +264,10 @@ class IndustrialEstateListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        try:
+            auto_repair_projected_geometries()
+        except Exception:
+            pass
         estates = IndustrialEstate.objects.all()
         return Response(IndustrialEstateSerializer(estates, many=True).data)
 

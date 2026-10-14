@@ -29,7 +29,18 @@ class BaseGeoSerializer(serializers.ModelSerializer):
             try:
                 from django.contrib.gis.geos import GEOSGeometry
                 g = GEOSGeometry(instance.geom)
-                ret['geom'] = g.geojson
+                extent = g.extent  # (xmin, ymin, xmax, ymax)
+                if extent and (abs(extent[1]) > 90 or abs(extent[3]) > 90 or abs(extent[0]) > 180 or abs(extent[2]) > 180):
+                    import pyproj
+                    from shapely.geometry import shape, mapping
+                    from shapely.ops import transform
+                    import json
+                    transformer = pyproj.Transformer.from_crs("EPSG:32646", "EPSG:4326", always_xy=True)
+                    sh_geom = shape(json.loads(g.geojson))
+                    reproj = transform(transformer.transform, sh_geom)
+                    ret['geom'] = json.dumps(mapping(reproj))
+                else:
+                    ret['geom'] = g.geojson
             except Exception:
                 pass
         return ret

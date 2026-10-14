@@ -473,7 +473,11 @@ export const useStore = create<PortalState>((set, get) => ({
   deleteBookmark: (id) => set((state) => ({
     bookmarks: state.bookmarks.filter((b) => b.id !== id)
   })),
-  zoomToCoordinates: (lng, lat, zoom = 14) => set({ mapCenter: [lng, lat], mapZoom: zoom }),
+  zoomToCoordinates: (lng, lat, zoom = 14) => {
+    if (!isNaN(lng) && !isNaN(lat) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+      set({ mapCenter: [lng, lat], mapZoom: zoom });
+    }
+  },
 
   // Spatial query
   spatialQueryType: 'buffer',
@@ -930,7 +934,8 @@ export const useStore = create<PortalState>((set, get) => ({
         await get().loadLayers();
         await get().loadInventory();
         await get().loadDashboardStats();
-        if (data.center_lng && data.center_lat) {
+        if (typeof data.center_lng === 'number' && typeof data.center_lat === 'number' &&
+            data.center_lat >= -90 && data.center_lat <= 90 && data.center_lng >= -180 && data.center_lng <= 180) {
           set({ mapCenter: [data.center_lng, data.center_lat], mapZoom: 15 });
         }
         get().addAuditLogEntry('UPLOAD_GIS', `Uploaded and registered spatial dataset: ${layerName}`);
@@ -1192,7 +1197,8 @@ export const useStore = create<PortalState>((set, get) => ({
     await get().loadLayers();
     await get().loadInventory();
     await get().loadDashboardStats();
-    if (data.center_lng && data.center_lat) {
+    if (typeof data.center_lng === 'number' && typeof data.center_lat === 'number' &&
+        data.center_lat >= -90 && data.center_lat <= 90 && data.center_lng >= -180 && data.center_lng <= 180) {
       set({ mapCenter: [data.center_lng, data.center_lat], mapZoom: 15 });
     }
     get().addAuditLogEntry('UPLOAD_GIS_CHUNKED', `Uploaded chunked spatial dataset: ${layerName}`);
