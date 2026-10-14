@@ -40,8 +40,9 @@ class WebApiTests(TestCase):
     def setUpClass(cls):
         super().setUpClass()
         from django.db import connection
-        with connection.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+        if connection.vendor == 'postgresql':
+            with connection.cursor() as cursor:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
 
     def setUp(self):
         from .models import LayerCategory
@@ -198,3 +199,87 @@ class WebApiTests(TestCase):
         data = response.json()
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["action_type"], "TEST_ACTION")
+
+    def test_login_brute_force_lockout(self):
+        """Verify OWASP A07: Brute force lockout after 5 consecutive failed login attempts"""
+        from .views import _FAILED_LOGINS
+        _FAILED_LOGINS.clear()
+
+        # Send 5 incorrect attempts
+        for _ in range(5):
+            res = self.client.post(
+                '/api/auth/login/',
+                data=json.dumps({"username": "gisadmin", "password": "wrongpassword"}),
+                content_type='application/json'
+            )
+            self.assertEqual(res.status_code, 400)
+
+        # 6th attempt should be blocked by rate-limiting with 429 Too Many Requests
+        blocked_res = self.client.post(
+            '/api/auth/login/',
+            data=json.dumps({"username": "gisadmin", "password": "wrongpassword"}),
+            content_type='application/json'
+        )
+        self.assertEqual(blocked_res.status_code, 429)
+        self.assertIn("locked", blocked_res.json()["error"].lower())
+
+        _FAILED_LOGINS.clear()
+
+    def test_chunked_upload_flow_and_security(self):
+        """Verify chunk upload, bounds validation, status checking, and assembly"""
+        import uuid
+        import io
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        upload_id = str(uuid.uuid4())
+        geojson_payload = json.dumps({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [[[91.7, 26.1], [91.8, 26.1], [91.8, 26.2], [91.7, 26.2], [91.7, 26.1]]]},
+                "properties": {"name": "Test Chunk Feature"}
+            }]
+        }).encode('utf-8')
+
+        chunk_file = SimpleUploadedFile("part.chunk", geojson_payload)
+
+        # 1. Upload valid chunk
+        res = self.client.post('/api/upload/chunk/', {
+            'upload_id': upload_id,
+            'chunk_index': 0,
+            'total_chunks': 1,
+            'file_name': 'test_survey.geojson',
+            'file_type': 'vector',
+            'chunk': chunk_file
+        })
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['status'], 'chunk_received')
+
+        # 2. Check status endpoint
+        status_res = self.client.get(f'/api/upload/chunk-status/?upload_id={upload_id}&total_chunks=1')
+        self.assertEqual(status_res.status_code, 200)
+        self.assertEqual(status_res.json()['received_chunks'], [0])
+        self.assertEqual(len(status_res.json()['missing_chunks']), 0)
+
+        # 3. Complete and assemble chunked vector upload
+        complete_res = self.client.post('/api/upload/chunk-complete/', {
+            'upload_id': upload_id,
+            'file_name': 'test_survey.geojson',
+            'file_type': 'vector',
+            'total_chunks': 1,
+            'layer_name': 'Test_Chunk_Vector_Layer'
+        })
+        self.assertEqual(complete_res.status_code, 200)
+        self.assertTrue(complete_res.json()['is_valid'])
+
+        # 4. Security Check: Malformed UUID should be rejected (OWASP A01 / A03)
+        bad_uuid_res = self.client.post('/api/upload/chunk/', {
+            'upload_id': '../../etc/passwd',
+            'chunk_index': 0,
+            'total_chunks': 1,
+            'file_name': 'hack.geojson',
+            'file_type': 'vector',
+            'chunk': SimpleUploadedFile("part.chunk", b"test")
+        })
+        self.assertEqual(bad_uuid_res.status_code, 400)
+

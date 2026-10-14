@@ -42,10 +42,15 @@ class User(models.Model):
         self.password_hash = make_password(raw_password)
 
     def check_password(self, raw_password):
-        # Allow checking against plain string or Django standard hash
+        # Allow checking against PBKDF2 or bcrypt standard hash
         if self.password_hash.startswith('pbkdf2_') or self.password_hash.startswith('bcrypt'):
             return check_password(raw_password, self.password_hash)
-        return self.password_hash == raw_password
+        # Migrate legacy plain-text password to PBKDF2 hash on successful login (OWASP A02)
+        if self.password_hash == raw_password:
+            self.set_password(raw_password)
+            self.save(update_fields=['password_hash'])
+            return True
+        return False
 
 
 class District(models.Model):
@@ -205,3 +210,31 @@ class IntegrationAdapter(models.Model):
 
     class Meta:
         db_table = 'integration_adapters'
+
+
+class DroneSurveyLayer(models.Model):
+    estate = models.ForeignKey(IndustrialEstate, on_delete=models.CASCADE, related_name='drone_surveys', null=True, blank=True)
+    estate_name = models.CharField(max_length=150, blank=True, null=True)
+    title = models.CharField(max_length=200)
+    survey_date = models.DateField(blank=True, null=True)
+    tile_directory = models.CharField(max_length=255) # e.g. drone_tiles/amerigog
+    tile_url_pattern = models.CharField(max_length=500) # e.g. /media/drone_tiles/amerigog/{z}/{x}/{y}.png
+    min_zoom = models.IntegerField(default=10)
+    max_zoom = models.IntegerField(default=21)
+    bounds = SafeJSONField(default=list) # [minLng, minLat, maxLng, maxLat]
+    footprint_geojson = SafeJSONField(default=dict) # Exact non-rectangular polygon footprint
+    raw_file_size_mb = models.FloatField(default=0.0)
+    resolution_cm_per_px = models.FloatField(default=5.0)
+    status = models.CharField(max_length=50, default='READY') # PENDING, PROCESSING, READY, FAILED
+    error_message = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'drone_survey_layers'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.title} ({self.estate_name or 'Independent'})"
+

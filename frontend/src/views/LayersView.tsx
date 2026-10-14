@@ -1,8 +1,9 @@
-import { useState } from 'react';
-import { useStore, GisLayer } from '../store/useStore.ts';
+import { useState, useEffect } from 'react';
+import { useStore, GisLayer, DroneSurveyLayerItem } from '../store/useStore.ts';
 import { 
   Eye, EyeOff, Sliders, Trash2, Edit3, Folder, ChevronDown, ChevronRight,
-  Search, Plus, MapPin, Table, Layers, AlertCircle, Filter, Sparkles
+  Search, Plus, MapPin, Table, Layers, AlertCircle, Filter, Sparkles,
+  Camera, CheckCircle2
 } from 'lucide-react';
 
 export default function LayersView() {
@@ -14,8 +15,17 @@ export default function LayersView() {
     updateLayer, 
     parcels, 
     estates,
-    zoomToCoordinates 
+    zoomToCoordinates,
+    droneLayers,
+    toggleDroneLayer,
+    deleteDroneLayer,
+    loadDroneLayers,
+    setShowDroneLayer
   } = useStore();
+
+  useEffect(() => {
+    loadDroneLayers();
+  }, []);
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState('');
@@ -38,6 +48,51 @@ export default function LayersView() {
   const [editCategoryInput, setEditCategoryInput] = useState('');
   const [deleteModalLayer, setDeleteModalLayer] = useState<GisLayer | null>(null);
   const [attributeSearch, setAttributeSearch] = useState('');
+
+  // Drone survey delete modal state
+  const [surveyToDelete, setSurveyToDelete] = useState<DroneSurveyLayerItem | null>(null);
+  const [isDeletingSurvey, setIsDeletingSurvey] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+
+  const handleViewDroneOnMap = (survey: DroneSurveyLayerItem) => {
+    toggleDroneLayer(survey.id);
+    setShowDroneLayer(true);
+    if (window.location.hash) {
+      window.location.hash = '#/map';
+    } else {
+      window.history.pushState(null, '', '/map');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }
+  };
+
+  const handleConfirmDeleteDroneSurvey = async () => {
+    if (!surveyToDelete) return;
+    setIsDeletingSurvey(true);
+    try {
+      await deleteDroneLayer(surveyToDelete.id);
+      setFeedbackMessage({
+        text: `Successfully deleted drone survey: "${surveyToDelete.title || surveyToDelete.estate_name}"`,
+        type: 'success'
+      });
+      setTimeout(() => setFeedbackMessage(null), 4000);
+    } catch (e: any) {
+      setFeedbackMessage({
+        text: `Failed to delete drone survey: ${e?.message || 'Server error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setFeedbackMessage(null), 4000);
+    } finally {
+      setIsDeletingSurvey(false);
+      setSurveyToDelete(null);
+    }
+  };
+
+  const filteredDroneSurveys = droneLayers.filter(dl => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    return (dl.title && dl.title.toLowerCase().includes(q)) ||
+           (dl.estate_name && dl.estate_name.toLowerCase().includes(q));
+  });
 
   // Group layers by category
   const categories = layers.reduce((acc, layer) => {
@@ -187,8 +242,20 @@ export default function LayersView() {
         </div>
       </div>
 
+      {/* Feedback banner if set */}
+      {feedbackMessage && (
+        <div className={`p-4 rounded-xl text-xs font-bold border flex items-center justify-between animate-in fade-in duration-200 ${
+          feedbackMessage.type === 'success' 
+            ? 'bg-emerald-50 border-emerald-200 text-emerald-800' 
+            : 'bg-rose-50 border-rose-200 text-rose-800'
+        }`}>
+          <span>{feedbackMessage.text}</span>
+          <button onClick={() => setFeedbackMessage(null)} className="text-slate-400 hover:text-slate-600 font-bold ml-4">✕</button>
+        </div>
+      )}
+
       {/* 2. KPI Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
         <div className="bg-white p-4 border border-slate-200 rounded-xl shadow-sm flex items-center justify-between">
           <div>
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total GIS Layers</span>
@@ -228,6 +295,16 @@ export default function LayersView() {
             <Folder className="w-5 h-5" />
           </div>
         </div>
+
+        <div className="bg-white p-4 border border-slate-200 rounded-xl shadow-sm flex items-center justify-between col-span-2 sm:col-span-1">
+          <div>
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Drone Orthomosaics</span>
+            <div className="text-xl font-black text-cyan-600 mt-0.5">{droneLayers.length}</div>
+          </div>
+          <div className="p-2.5 bg-cyan-50 text-cyan-600 rounded-lg">
+            <Camera className="w-5 h-5" />
+          </div>
+        </div>
       </div>
 
       {/* 3. Search & Filter Bar */}
@@ -236,7 +313,7 @@ export default function LayersView() {
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
           <input
             type="text"
-            placeholder="Search layers by display name, format, or category..."
+            placeholder="Search layers by display name, format, estate, or category..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-9 pr-4 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-gov-blue"
@@ -250,7 +327,8 @@ export default function LayersView() {
             onChange={(e) => setSelectedCategoryFilter(e.target.value)}
             className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 font-semibold text-slate-700 focus:outline-none focus:border-gov-blue"
           >
-            <option value="ALL">All Categories ({layers.length})</option>
+            <option value="ALL">All Categories & Layers ({layers.length + droneLayers.length})</option>
+            <option value="DRONE_ORTHOMOSAICS">Drone Orthomosaics ({droneLayers.length})</option>
             {Object.keys(categories).map(cat => (
               <option key={cat} value={cat}>{cat} ({categories[cat].length})</option>
             ))}
@@ -258,7 +336,132 @@ export default function LayersView() {
         </div>
       </div>
 
-      {/* 4. Hierarchical Layer Tree Catalog */}
+      {/* 4. High-Resolution Drone Orthomosaics & Aerial Imagery Catalog */}
+      {(selectedCategoryFilter === 'ALL' || selectedCategoryFilter === 'DRONE_ORTHOMOSAICS') && (
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm space-y-0">
+          <div className="p-4 bg-gradient-to-r from-slate-900 via-slate-800 to-cyan-950 text-white flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-xl bg-cyan-500/20 border border-cyan-500/40 text-cyan-400">
+                <Camera className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-extrabold tracking-wide text-white">Drone Orthomosaics & Aerial Imagery</h2>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono">
+                    {droneLayers.length} Registered Surveys
+                  </span>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
+                    5cm GSD Multi-Res
+                  </span>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/40 font-mono">
+                    Redis RAM L2
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-300 mt-0.5">
+                  Centimeter-accurate GeoTIFF orthomosaics with Slippy XYZ pyramids. Manage datasets, view coverage on map, or permanently delete surveys from here.
+                </p>
+              </div>
+            </div>
+
+            <a
+              href="#/upload"
+              className="text-xs px-3 py-1.5 font-bold text-slate-950 bg-cyan-400 hover:bg-cyan-300 rounded-lg shadow-sm flex items-center gap-1.5 transition self-end sm:self-center shrink-0"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Upload Drone GeoTIFF
+            </a>
+          </div>
+
+          {filteredDroneSurveys.length === 0 ? (
+            <div className="p-8 text-center text-slate-400 space-y-2">
+              <Camera className="w-8 h-8 mx-auto text-slate-300" />
+              <p className="text-xs font-semibold text-slate-600">No drone surveys match your filter.</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100">
+              <div className="hidden md:grid grid-cols-12 gap-3 px-4 py-2 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                <div className="col-span-4">Estate & Survey Name</div>
+                <div className="col-span-2">Resolution / GSD</div>
+                <div className="col-span-2">Pyramid & Size</div>
+                <div className="col-span-2">Status & Date</div>
+                <div className="col-span-2 text-right">Actions</div>
+              </div>
+
+              {filteredDroneSurveys.map((dl) => (
+                <div key={dl.id} className="p-4 hover:bg-slate-50/80 transition flex flex-col md:grid md:grid-cols-12 gap-3 items-start md:items-center">
+                  {/* Title & Estate */}
+                  <div className="col-span-4 flex items-center gap-3">
+                    <div className="p-2 rounded-lg bg-cyan-50 text-cyan-600 border border-cyan-100 shrink-0">
+                      <Camera className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <h4 className="text-xs font-bold text-slate-800 truncate">{dl.title}</h4>
+                      <p className="text-[11px] text-gov-blue font-semibold truncate flex items-center gap-1">
+                        <MapPin className="w-3 h-3 shrink-0" />
+                        {dl.estate_name || 'Independent Survey'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Resolution / GSD */}
+                  <div className="col-span-2 flex items-center gap-1.5 text-xs">
+                    <span className="font-bold text-slate-700">{dl.resolution_cm_per_px ? `${dl.resolution_cm_per_px} cm/px` : '5.0 cm/px'}</span>
+                    <span className="text-[10px] font-mono text-cyan-700 bg-cyan-50 px-1.5 py-0.5 rounded border border-cyan-200">
+                      High-Res
+                    </span>
+                  </div>
+
+                  {/* Pyramid & Size */}
+                  <div className="col-span-2 text-xs">
+                    <span className="font-bold text-slate-700 font-mono">
+                      {dl.raw_file_size_mb ? `${dl.raw_file_size_mb} MB` : 'Tile Pyramid'}
+                    </span>
+                    <span className="text-[10px] text-slate-400 block font-mono">
+                      Zooms {dl.min_zoom}-{dl.max_zoom}
+                    </span>
+                  </div>
+
+                  {/* Status & Date */}
+                  <div className="col-span-2 flex flex-col items-start gap-1">
+                    <span className="inline-flex items-center gap-1 text-[10.5px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                      <CheckCircle2 className="w-3 h-3" />
+                      {dl.status}
+                    </span>
+                    {dl.survey_date && (
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        {dl.survey_date}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Actions: View on Map & Delete */}
+                  <div className="col-span-2 flex items-center justify-end gap-2 w-full md:w-auto">
+                    <button
+                      onClick={() => handleViewDroneOnMap(dl)}
+                      className="px-2.5 py-1.5 bg-gov-blue hover:bg-gov-navy text-white text-[11px] font-bold rounded-lg shadow-xs transition flex items-center gap-1 cursor-pointer"
+                      title="Open and center on interactive map"
+                    >
+                      <MapPin className="w-3 h-3" />
+                      <span>View</span>
+                    </button>
+                    <button
+                      onClick={() => setSurveyToDelete(dl)}
+                      className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 hover:text-rose-700 border border-rose-200 text-[11px] font-bold rounded-lg transition flex items-center gap-1 cursor-pointer"
+                      title="Permanently delete this drone survey"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Delete</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 5. Hierarchical Vector Layer Tree Catalog */}
+      {selectedCategoryFilter !== 'DRONE_ORTHOMOSAICS' && (
       <div className="space-y-4">
         {filteredCategoryNames.length === 0 ? (
           <div className="bg-white border border-slate-200 rounded-xl p-12 text-center text-slate-400 space-y-3">
@@ -482,6 +685,7 @@ export default function LayersView() {
           })
         )}
       </div>
+      )}
 
       {/* MODAL 1: Attribute Table Inspector Modal */}
       {attributeTableModalLayer && (
@@ -639,6 +843,80 @@ export default function LayersView() {
                 className="px-4 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-lg shadow-sm"
               >
                 Delete Permanently
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 4: Delete Drone Survey Confirmation Modal */}
+      {surveyToDelete && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-4">
+            <div className="flex items-center gap-3 border-b border-slate-100 pb-3">
+              <div className="p-2.5 rounded-xl bg-red-50 text-red-600 border border-red-200">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-extrabold text-sm text-slate-900">Delete Drone Orthomosaic Survey</h3>
+                <p className="text-[11px] text-slate-500">Permanent deletion of generated tiles and dataset records.</p>
+              </div>
+            </div>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2 text-xs">
+              <div className="flex justify-between">
+                <span className="text-slate-500 font-semibold">Survey Title:</span>
+                <span className="font-bold text-slate-800 truncate max-w-[220px]">{surveyToDelete.title}</span>
+              </div>
+              {surveyToDelete.estate_name && (
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-semibold">Industrial Estate:</span>
+                  <span className="font-bold text-gov-blue truncate max-w-[220px]">{surveyToDelete.estate_name}</span>
+                </div>
+              )}
+              {surveyToDelete.raw_file_size_mb ? (
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-semibold">Dataset Size:</span>
+                  <span className="font-mono text-slate-700">{surveyToDelete.raw_file_size_mb} MB</span>
+                </div>
+              ) : null}
+              {surveyToDelete.survey_date && (
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-semibold">Capture Date:</span>
+                  <span className="font-mono text-slate-700">{surveyToDelete.survey_date}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-[11px] text-red-800 leading-relaxed">
+              ⚠️ Are you sure you want to permanently delete the drone survey for <strong>{surveyToDelete.estate_name || surveyToDelete.title}</strong>? All multi-resolution Slippy Map pyramid tiles on disk and database records will be erased.
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setSurveyToDelete(null)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingSurvey}
+                onClick={handleConfirmDeleteDroneSurvey}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-extrabold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isDeletingSurvey ? (
+                  <>
+                    <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                    <span>Deleting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Yes, Permanently Delete</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

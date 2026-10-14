@@ -2,7 +2,8 @@ from rest_framework import serializers
 from .models import (
     Role, User, District, Circle, Village, IndustrialEstate,
     LandParcel, InfrastructureLayer, LayerCategory, GisLayer,
-    LayerMetadata, AuditLog, SystemSetting, IntegrationAdapter
+    LayerMetadata, AuditLog, SystemSetting, IntegrationAdapter,
+    DroneSurveyLayer
 )
 import json
 
@@ -117,3 +118,12 @@ class IntegrationAdapterSerializer(serializers.ModelSerializer):
     class Meta:
         model = IntegrationAdapter
         fields = '__all__'
+
+
+class DroneSurveyLayerSerializer(serializers.ModelSerializer):
+    estate_title = serializers.CharField(source='estate.name', read_only=True)
+
+    class Meta:
+        model = DroneSurveyLayer
+        fields = '__all__'
+

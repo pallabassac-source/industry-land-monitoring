@@ -15,6 +15,10 @@ export default defineConfig({
         target: 'http://backend:8000',
         changeOrigin: true,
       },
+      '/media': {
+        target: 'http://backend:8000',
+        changeOrigin: true,
+      },
       '/ogc': {
         target: 'http://mapserver:80',
         changeOrigin: true,

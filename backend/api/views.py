@@ -8,22 +8,61 @@ from django.utils import timezone
 from .models import (
     Role, User, District, Circle, Village, IndustrialEstate,
     LandParcel, InfrastructureLayer, LayerCategory, GisLayer,
-    LayerMetadata, AuditLog, SystemSetting, IntegrationAdapter
+    LayerMetadata, AuditLog, SystemSetting, IntegrationAdapter,
+    DroneSurveyLayer
 )
 from .serializers import (
     RoleSerializer, UserSerializer, DistrictSerializer, CircleSerializer,
     VillageSerializer, IndustrialEstateSerializer, LandParcelSerializer,
     InfrastructureLayerSerializer, LayerCategorySerializer, GisLayerSerializer,
     LayerMetadataSerializer, AuditLogSerializer, SystemSettingSerializer,
-    IntegrationAdapterSerializer
+    IntegrationAdapterSerializer, DroneSurveyLayerSerializer
 )
 from .utils_gis import (
     execute_spatial_query, validate_and_parse_spatial_file, 
     validate_and_parse_component_files, save_spatial_features_to_db, 
     delete_layer_cascade
 )
+from .tasks import dispatch_drone_tiling_job
+from .utils_drone import get_geotiff_metadata
 import json
 import traceback
+
+from .chunked_upload import (
+    validate_upload_params, save_incoming_chunk, 
+    get_session_status, assemble_session_chunks,
+    sanitize_filename
+)
+from rest_framework.exceptions import ValidationError
+import time
+import os
+import shutil
+
+# In-memory brute force lockout tracking (OWASP A07 & A09)
+_FAILED_LOGINS = {}
+MAX_FAILED_LOGIN_ATTEMPTS = 5
+LOCKOUT_DURATION_SECONDS = 900  # 15 minutes lockout
+
+def is_login_rate_limited(identifier: str) -> bool:
+    if not identifier:
+        return False
+    now = time.time()
+    attempts = _FAILED_LOGINS.get(identifier, [])
+    recent_attempts = [t for t in attempts if now - t < LOCKOUT_DURATION_SECONDS]
+    _FAILED_LOGINS[identifier] = recent_attempts
+    return len(recent_attempts) >= MAX_FAILED_LOGIN_ATTEMPTS
+
+def record_failed_login(identifier: str):
+    if not identifier:
+        return
+    now = time.time()
+    attempts = _FAILED_LOGINS.get(identifier, [])
+    attempts.append(now)
+    _FAILED_LOGINS[identifier] = attempts
+
+def clear_failed_login(identifier: str):
+    if identifier and identifier in _FAILED_LOGINS:
+        _FAILED_LOGINS.pop(identifier, None)
 
 def log_audit_trail(user_id, username, action_type, details, client_ip='127.0.0.1', old_val=None, new_val=None):
     """
@@ -43,24 +82,39 @@ def log_audit_trail(user_id, username, action_type, details, client_ip='127.0.0.
         pass
 
 
-# 1. Authentication View
+# 1. Authentication View with Brute-Force Protection (OWASP A07)
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        username = request.data.get('username')
+        client_ip = request.META.get('REMOTE_ADDR', '127.0.0.1')
+        username = str(request.data.get('username', '')).strip()
         password = request.data.get('password')
         
+        # Check rate limiting / brute force lockout
+        if is_login_rate_limited(client_ip) or is_login_rate_limited(username):
+            log_audit_trail(
+                None, username or 'unknown', 'LOGIN_LOCKED',
+                f"Brute-force protection: IP {client_ip} / account {username} locked for 15 minutes.",
+                client_ip
+            )
+            return Response(
+                {'error': 'Too many failed login attempts. Account temporarily locked for 15 minutes.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS
+            )
+
         try:
             user = User.objects.get(username=username, is_active=True)
             if user.check_password(password):
+                clear_failed_login(client_ip)
+                clear_failed_login(username)
                 refresh = RefreshToken.for_user(user)
                 
-                # Log login audit trail
+                # Log login audit trail (OWASP A09)
                 log_audit_trail(
                     user.id, user.username, 'LOGIN',
                     f"User {user.username} logged in successfully.",
-                    request.META.get('REMOTE_ADDR')
+                    client_ip
                 )
                 
                 return Response({
@@ -69,8 +123,22 @@ class LoginView(APIView):
                     'user': UserSerializer(user).data
                 })
             else:
+                record_failed_login(client_ip)
+                record_failed_login(username)
+                log_audit_trail(
+                    user.id, user.username, 'LOGIN_FAILED',
+                    f"Failed login attempt (invalid credentials) for user {username}.",
+                    client_ip
+                )
                 return Response({'error': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
         except User.DoesNotExist:
+            record_failed_login(client_ip)
+            record_failed_login(username)
+            log_audit_trail(
+                None, username or 'unknown', 'LOGIN_FAILED',
+                f"Failed login attempt (user not found: {username}).",
+                client_ip
+            )
             return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
@@ -491,3 +559,411 @@ class ExternalSyncTriggerView(APIView):
             'features_processed': 15,
             'details': 'OGC Web services synchronization and adapters executed successfully.'
         })
+
+
+def ensure_drone_table_exists():
+    """
+    Guarantees drone_survey_layers table exists in PostGIS even if migrations weren't run.
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS drone_survey_layers (
+                    id SERIAL PRIMARY KEY,
+                    estate_id INTEGER REFERENCES industrial_estates(id) ON DELETE CASCADE,
+                    estate_name VARCHAR(150),
+                    title VARCHAR(200) NOT NULL,
+                    survey_date DATE,
+                    tile_directory VARCHAR(255) NOT NULL DEFAULT '',
+                    tile_url_pattern VARCHAR(500) NOT NULL DEFAULT '',
+                    min_zoom INTEGER DEFAULT 14,
+                    max_zoom INTEGER DEFAULT 21,
+                    bounds JSONB DEFAULT '[]'::jsonb,
+                    footprint_geojson JSONB DEFAULT '{}'::jsonb,
+                    raw_file_size_mb DOUBLE PRECISION DEFAULT 0.0,
+                    resolution_cm_per_px DOUBLE PRECISION DEFAULT 5.0,
+                    status VARCHAR(50) DEFAULT 'READY',
+                    error_message TEXT,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                ALTER TABLE drone_survey_layers ADD COLUMN IF NOT EXISTS footprint_geojson JSONB DEFAULT '{}'::jsonb;
+                CREATE INDEX IF NOT EXISTS idx_drone_surveys_estate ON drone_survey_layers(estate_id);
+            """)
+    except Exception as e:
+        pass
+
+
+# 15. Drone Survey Multi-Resolution Layers & Ingestion Views
+class DroneSurveyLayerListView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        ensure_drone_table_exists()
+        try:
+            estate_id = request.query_params.get('estate_id')
+            queryset = DroneSurveyLayer.objects.all()
+            if estate_id:
+                queryset = queryset.filter(estate_id=estate_id)
+            
+            status_filter = request.query_params.get('status')
+            if status_filter:
+                queryset = queryset.filter(status=status_filter)
+
+            serializer = DroneSurveyLayerSerializer(queryset, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response([], status=status.HTTP_200_OK)
+
+
+class DroneSurveyUploadView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        ensure_drone_table_exists()
+        try:
+            uploaded_file = request.FILES.get('file')
+            if not uploaded_file:
+                return Response({'error': 'No GeoTIFF file provided in the upload request'}, status=status.HTTP_400_BAD_REQUEST)
+
+            file_name = uploaded_file.name
+            ext = file_name.split('.')[-1].lower()
+            if ext not in ['tif', 'tiff', 'geotiff']:
+                return Response({'error': 'Only .tif, .tiff, or .geotiff formats are supported for drone imagery'}, status=status.HTTP_400_BAD_REQUEST)
+
+            estate_id = request.data.get('estate_id')
+            title = request.data.get('title')
+            survey_date = request.data.get('survey_date') or timezone.now().date().isoformat()
+
+            estate = None
+            estate_name = None
+            if estate_id and str(estate_id).strip() not in ['', 'null', 'undefined']:
+                try:
+                    estate = IndustrialEstate.objects.get(id=int(estate_id))
+                    estate_name = estate.name
+                except Exception:
+                    pass
+
+            if not title:
+                base_name = file_name.rsplit('.', 1)[0].replace('_', ' ')
+                title = f"{estate_name or base_name} Drone Survey"
+
+            # 1. Save uploaded file to temp disk
+            from django.conf import settings
+            import os
+            media_root = getattr(settings, 'MEDIA_ROOT', os.path.join(settings.BASE_DIR, 'mediafiles'))
+            temp_dir = os.path.join(media_root, 'temp_uploads')
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_tif_path = os.path.join(temp_dir, f"upload_{timezone.now().strftime('%Y%m%d_%H%M%S')}_{file_name}")
+
+            with open(temp_tif_path, 'wb+') as destination:
+                for chunk in uploaded_file.chunks():
+                    destination.write(chunk)
+
+            # 2. Extract initial metadata
+            meta = get_geotiff_metadata(temp_tif_path)
+
+            # 3. Create DroneSurveyLayer record in PENDING / PROCESSING state
+            drone_layer = DroneSurveyLayer.objects.create(
+                estate=estate,
+                estate_name=estate_name,
+                title=title,
+                survey_date=survey_date,
+                tile_directory='',
+                tile_url_pattern='',
+                min_zoom=14,
+                max_zoom=20,
+                bounds=meta.get('bounds') or [91.70, 26.10, 91.85, 26.25],
+                footprint_geojson=meta.get('footprint_geojson') or {},
+                raw_file_size_mb=meta.get('file_size_mb') or 0.0,
+                resolution_cm_per_px=meta.get('resolution_cm') or 5.0,
+                status='PROCESSING'
+            )
+
+            # 4. Dispatch tiling worker (Celery or background thread)
+            dispatch_method = dispatch_drone_tiling_job(
+                layer_id=drone_layer.id,
+                tif_path=temp_tif_path,
+                delete_source=True
+            )
+
+            log_audit_trail(
+                request.user.id if hasattr(request, 'user') else None,
+                request.user.username if hasattr(request, 'user') else 'system',
+                'UPLOAD_DRONE_TIFF',
+                f"Queued drone GeoTIFF processing for '{title}' (file size: {drone_layer.raw_file_size_mb} MB) via {dispatch_method}.",
+                request.META.get('REMOTE_ADDR')
+            )
+
+            return Response({
+                'message': 'Drone GeoTIFF received and multi-resolution tile processing started.',
+                'layer_id': drone_layer.id,
+                'title': drone_layer.title,
+                'status': drone_layer.status,
+                'bounds': drone_layer.bounds,
+                'dispatch_method': dispatch_method
+            }, status=status.HTTP_202_ACCEPTED)
+
+        except Exception as e:
+            trace = traceback.format_exc()
+            print(f"Drone upload error: {trace}")
+            return Response({
+                'error': f"Server error processing upload: {str(e)}",
+                'details': trace
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class DroneSurveyLayerDetailView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        ensure_drone_table_exists()
+        layer = get_object_or_404(DroneSurveyLayer, pk=pk)
+        return Response(DroneSurveyLayerSerializer(layer).data, status=status.HTTP_200_OK)
+
+    def patch(self, request, pk):
+        ensure_drone_table_exists()
+        layer = get_object_or_404(DroneSurveyLayer, pk=pk)
+        for field in ['title', 'survey_date', 'is_active', 'min_zoom', 'max_zoom', 'estate_id']:
+            if field in request.data:
+                setattr(layer, field, request.data[field])
+        layer.save()
+        return Response(DroneSurveyLayerSerializer(layer).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, pk):
+        ensure_drone_table_exists()
+        layer = get_object_or_404(DroneSurveyLayer, pk=pk)
+        
+        # Remove tiles from disk if directory exists
+        from django.conf import settings
+        import os
+        import shutil
+        if layer.tile_directory:
+            media_root = getattr(settings, 'MEDIA_ROOT', os.path.join(settings.BASE_DIR, 'mediafiles'))
+            abs_tile_dir = os.path.join(media_root, layer.tile_directory)
+            if os.path.exists(abs_tile_dir):
+                try:
+                    shutil.rmtree(abs_tile_dir)
+                except Exception:
+                    pass
+
+        layer_title = layer.title
+        layer.delete()
+
+        log_audit_trail(
+            request.user.id if hasattr(request, 'user') else None,
+            request.user.username if hasattr(request, 'user') else 'system',
+            'DELETE_DRONE_LAYER',
+            f"Deleted drone survey layer: {layer_title}.",
+            request.META.get('REMOTE_ADDR')
+        )
+
+        return Response({'message': f"Drone survey layer '{layer_title}' deleted successfully."}, status=status.HTTP_200_OK)
+
+
+# 16. Chunked Upload REST Services (WAF-Friendly & Anti-DDoS Protected)
+class ChunkUploadView(APIView):
+    """
+    Receives an individual sliced binary chunk (e.g. 10MB - 40MB).
+    Validates chunk size, bounds, UUID, and saves to staging directory.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        upload_id = request.data.get('upload_id')
+        chunk_index_raw = request.data.get('chunk_index')
+        total_chunks_raw = request.data.get('total_chunks')
+        file_name = request.data.get('file_name')
+        file_type = request.data.get('file_type', 'drone')
+        chunk_file = request.FILES.get('chunk')
+
+        if not chunk_file:
+            return Response({'error': 'No chunk payload provided in request.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            chunk_index = int(chunk_index_raw)
+            total_chunks = int(total_chunks_raw)
+        except (ValueError, TypeError):
+            return Response({'error': 'chunk_index and total_chunks must be valid integers.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            safe_name, f_type = validate_upload_params(
+                upload_id=upload_id,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                file_name=file_name,
+                file_type=file_type,
+                chunk_file=chunk_file
+            )
+            save_incoming_chunk(upload_id, chunk_index, chunk_file)
+
+            return Response({
+                'status': 'chunk_received',
+                'upload_id': upload_id,
+                'chunk_index': chunk_index,
+                'total_chunks': total_chunks,
+                'file_name': safe_name
+            }, status=status.HTTP_200_OK)
+
+        except ValidationError as ve:
+            return Response(ve.detail, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            trace = traceback.format_exc()
+            print(f"Chunk upload error: {trace}")
+            return Response({'error': f"Failed to store chunk: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ChunkStatusView(APIView):
+    """
+    Returns received and missing chunks for an active upload_id.
+    Enables instant client-side resume after connection drops or WAF rate-limit timeouts.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        upload_id = request.query_params.get('upload_id')
+        total_chunks_raw = request.query_params.get('total_chunks')
+        if not upload_id:
+            return Response({'error': 'upload_id query parameter is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        total_chunks = None
+        if total_chunks_raw:
+            try:
+                total_chunks = int(total_chunks_raw)
+            except ValueError:
+                pass
+
+        session_status = get_session_status(upload_id, total_chunks)
+        return Response(session_status, status=status.HTTP_200_OK)
+
+
+class ChunkCompleteView(APIView):
+    """
+    Assembles all received chunks into the final dataset, validates integrity,
+    and dispatches the appropriate pipeline (GeoTIFF LOD tiling or Vector DB ingestion).
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        upload_id = request.data.get('upload_id')
+        file_name = request.data.get('file_name')
+        file_type = request.data.get('file_type', 'drone')
+        total_chunks_raw = request.data.get('total_chunks')
+
+        try:
+            total_chunks = int(total_chunks_raw)
+        except (ValueError, TypeError):
+            return Response({'error': 'total_chunks must be a valid integer.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            safe_name, f_type = validate_upload_params(
+                upload_id=upload_id,
+                chunk_index=0,
+                total_chunks=total_chunks,
+                file_name=file_name,
+                file_type=file_type
+            )
+
+            # Assemble chunks into target file
+            assembled_path = assemble_session_chunks(upload_id, safe_name, f_type, total_chunks)
+
+            # PIPELINE 1: DRONE GEOTIFF
+            if f_type == 'drone':
+                ensure_drone_table_exists()
+                estate_id = request.data.get('estate_id')
+                title = request.data.get('title')
+                survey_date = request.data.get('survey_date') or timezone.now().date().isoformat()
+
+                estate = None
+                estate_name = None
+                if estate_id and str(estate_id).strip() not in ['', 'null', 'undefined']:
+                    try:
+                        estate = IndustrialEstate.objects.get(id=int(estate_id))
+                        estate_name = estate.name
+                    except Exception:
+                        pass
+
+                if not title:
+                    base_name = safe_name.rsplit('.', 1)[0].replace('_', ' ')
+                    title = f"{estate_name or base_name} Drone Survey"
+
+                meta = get_geotiff_metadata(assembled_path)
+                drone_layer = DroneSurveyLayer.objects.create(
+                    estate=estate,
+                    estate_name=estate_name,
+                    title=title,
+                    survey_date=survey_date,
+                    tile_directory='',
+                    tile_url_pattern='',
+                    min_zoom=14,
+                    max_zoom=20,
+                    bounds=meta.get('bounds') or [91.70, 26.10, 91.85, 26.25],
+                    footprint_geojson=meta.get('footprint_geojson') or {},
+                    raw_file_size_mb=meta.get('file_size_mb') or 0.0,
+                    resolution_cm_per_px=meta.get('resolution_cm') or 5.0,
+                    status='PROCESSING'
+                )
+
+                dispatch_method = dispatch_drone_tiling_job(
+                    layer_id=drone_layer.id,
+                    tif_path=assembled_path,
+                    delete_source=True
+                )
+
+                log_audit_trail(
+                    request.user.id if hasattr(request, 'user') else None,
+                    request.user.username if hasattr(request, 'user') else 'system',
+                    'UPLOAD_DRONE_TIFF_CHUNKED',
+                    f"Successfully assembled and queued chunked drone survey '{title}' ({drone_layer.raw_file_size_mb} MB) via {dispatch_method}.",
+                    request.META.get('REMOTE_ADDR')
+                )
+
+                return Response({
+                    'message': 'Drone GeoTIFF chunks assembled successfully and tiling worker dispatched.',
+                    'layer_id': drone_layer.id,
+                    'title': drone_layer.title,
+                    'status': drone_layer.status,
+                    'bounds': drone_layer.bounds,
+                    'dispatch_method': dispatch_method
+                }, status=status.HTTP_202_ACCEPTED)
+
+            # PIPELINE 2: VECTOR SHAPEFILE / GEOJSON
+            elif f_type == 'vector':
+                layer_name = request.data.get('layer_name') or safe_name.rsplit('.', 1)[0]
+                with open(assembled_path, 'rb') as f:
+                    file_bytes = f.read()
+
+                # Clean up assembled temp file
+                try:
+                    os.remove(assembled_path)
+                except Exception:
+                    pass
+
+                report = validate_and_parse_spatial_file(safe_name, file_bytes)
+                if report.get('is_valid'):
+                    layer_id = save_spatial_features_to_db(layer_name, report)
+                    report['layer_id'] = layer_id
+                    log_audit_trail(
+                        request.user.id if hasattr(request, 'user') else None,
+                        request.user.username if hasattr(request, 'user') else 'system',
+                        'UPLOAD_GIS_CHUNKED',
+                        f"Successfully parsed and published GIS layer: {layer_name} from chunked upload {safe_name}.",
+                        request.META.get('REMOTE_ADDR')
+                    )
+                    return Response(report, status=status.HTTP_200_OK)
+                else:
+                    return Response(report, status=status.HTTP_400_BAD_REQUEST)
+
+        except ValidationError as ve:
+            return Response(ve.detail, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            trace = traceback.format_exc()
+            print(f"Chunk completion error: {trace}")
+            return Response({
+                'error': f"Failed to assemble file: {str(e)}",
+                'details': trace
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+

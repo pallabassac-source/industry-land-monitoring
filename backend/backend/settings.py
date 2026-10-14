@@ -107,9 +107,21 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'mediafiles')
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# CORS Config
+# CORS Config (OWASP A05 - Avoid wildcard origin with credentials)
 CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_CREDENTIALS = False
+
+# OWASP Recommended Security Headers (A05: Security Misconfiguration)
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'SAMEORIGIN'
+SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+
+# Cookie and Session Security (A07)
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = 'Lax'
 
 # REST Framework Configuration
 REST_FRAMEWORK = {
@@ -139,3 +151,9 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
+
+# Large GeoTIFF and GIS Upload Limits (Up to 2.5 GB)
+DATA_UPLOAD_MAX_MEMORY_SIZE = 2684354560  # 2.5 GB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2684354560  # 2.5 GB
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000
+

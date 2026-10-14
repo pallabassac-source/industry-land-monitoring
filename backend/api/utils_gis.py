@@ -60,11 +60,21 @@ def execute_spatial_query(query_type, layer_name, geom_wkt=None, distance_meters
             where_clauses.append("ST_DWithin(geom::geography, ST_GeomFromText(%s, 4326)::geography, %s)")
             params.extend([geom_wkt, float(distance_meters)])
 
+    # Sanitize field names to prevent SQL injection (OWASP A03)
+    allowed_fields = {
+        'parcels': ['parcel_id', 'plot_number', 'survey_number', 'area_acres', 'availability_status', 'land_classification', 'ownership_details'],
+        'estates': ['name', 'total_area_acres', 'available_area_acres', 'power_capacity_mw'],
+        'infrastructure': ['name', 'infra_type'],
+        'districts': ['name', 'code'],
+        'circles': ['name', 'code'],
+        'villages': ['name', 'code']
+    }.get(layer_name, ['name', 'parcel_id', 'plot_number', 'availability_status'])
+
     # Apply attribute filters
     if attribute_filters:
         if isinstance(attribute_filters, dict):
             for k, v in attribute_filters.items():
-                if v:
+                if k in allowed_fields and v is not None:
                     where_clauses.append(f"{k} = %s")
                     params.append(v)
         elif isinstance(attribute_filters, list):
@@ -74,12 +84,6 @@ def execute_spatial_query(query_type, layer_name, geom_wkt=None, distance_meters
                 val = cond.get('value')
                 if not field or not op or val is None:
                     continue
-                # Sanitize field name to prevent SQL injection
-                allowed_fields = {
-                    'parcels': ['parcel_id', 'plot_number', 'survey_number', 'area_acres', 'availability_status', 'land_classification', 'ownership_details'],
-                    'estates': ['name', 'total_area_acres', 'available_area_acres', 'power_capacity_mw'],
-                    'infrastructure': ['name', 'infra_type']
-                }.get(layer_name, [])
                 if field in allowed_fields and op in ['=', '>', '<', '>=', '<=', 'contains', 'like']:
                     if op in ['like', 'contains']:
                         where_clauses.append(f"{field} ILIKE %s")
@@ -288,7 +292,12 @@ def validate_and_parse_spatial_file(file_name, file_content_bytes):
                     f.write(file_content_bytes)
                 
                 with zipfile.ZipFile(zip_path, 'r') as z:
-                    z.extractall(tmp_dir)
+                    for member in z.infolist():
+                        # Prevent Zip Slip / Directory Traversal vulnerability (OWASP A01 & A03)
+                        target_path = os.path.realpath(os.path.join(tmp_dir, member.filename))
+                        if not target_path.startswith(os.path.realpath(tmp_dir) + os.sep):
+                            raise ValueError(f"Dangerous path traversal detected in ZIP archive: {member.filename}")
+                        z.extract(member, tmp_dir)
 
                 # Search for .shp file
                 shp_files = []
@@ -434,7 +443,7 @@ def save_spatial_features_to_db(layer_name, report_data, category_id=2):
         cursor.execute(
             """
             INSERT INTO gis_layers (name, display_name, category_id, layer_type, source_type, is_published, style_config, display_order, created_at)
-            VALUES (%s, %s, %s, %s, 'PostGIS', TRUE, '{"outline": "#0369a1", "fill": "rgba(2, 132, 199, 0.2)"}', 1, NOW())
+            VALUES (%s, %s, %s, %s, 'PostGIS', TRUE, '{"outline": "#0369a1", "fill": "rgba(2, 132, 199, 0.2)"}', 1, CURRENT_TIMESTAMP)
             ON CONFLICT (name) DO UPDATE SET display_name = EXCLUDED.display_name
             RETURNING id
             """,
@@ -447,7 +456,7 @@ def save_spatial_features_to_db(layer_name, report_data, category_id=2):
             cursor.execute(
                 """
                 INSERT INTO layer_metadata (layer_id, description, source_department, data_owner, coordinate_reference_system, scale, version, license, keywords, last_updated)
-                VALUES (%s, %s, 'GIS Administration', 'Admin User', %s, '1:1000', '1.0', 'Open Government Data License', '{}', NOW())
+                VALUES (%s, %s, 'GIS Administration', 'Admin User', %s, '1:1000', '1.0', 'Open Government Data License', '{}', CURRENT_TIMESTAMP)
                 ON CONFLICT DO NOTHING
                 """,
                 [layer_id, f"Uploaded Dataset: {layer_name}", report_data.get('crs_detected', 'EPSG:4326')]
@@ -461,10 +470,11 @@ def save_spatial_features_to_db(layer_name, report_data, category_id=2):
             estate_name = f"{layer_name} Industrial Area"
             estate_wkt = parsed_features[0]['wkt']
 
+            geom_fn = "ST_GeomFromText(%s, 4326)" if connection.vendor == 'postgresql' else "%s"
             cursor.execute(
-                """
+                f"""
                 INSERT INTO industrial_estates (name, total_area_acres, allocated_area_acres, available_area_acres, power_capacity_mw, water_capacity_mld, gas_pipeline_available, drainage_available, created_at, geom)
-                VALUES (%s, %s, %s, %s, 10.00, 5.00, TRUE, TRUE, NOW(), ST_GeomFromText(%s, 4326))
+                VALUES (%s, %s, %s, %s, 10.00, 5.00, TRUE, TRUE, CURRENT_TIMESTAMP, {geom_fn})
                 ON CONFLICT (name) DO UPDATE SET total_area_acres = EXCLUDED.total_area_acres, geom = EXCLUDED.geom
                 RETURNING id
                 """,
@@ -479,9 +489,9 @@ def save_spatial_features_to_db(layer_name, report_data, category_id=2):
                     p_id = f"LP-{clean_name_code}-{idx+1:03d}"
                     attrs_json = json.dumps(feat.get('attributes', {}))
                     cursor.execute(
-                        """
+                        f"""
                         INSERT INTO land_parcels (estate_id, parcel_id, plot_number, area_acres, availability_status, land_classification, ownership_details, infrastructure_details, photo_urls, created_at, geom)
-                        VALUES (%s, %s, %s, %s, %s, 'General', 'Government Land Bank', %s, '{}', NOW(), ST_GeomFromText(%s, 4326))
+                        VALUES (%s, %s, %s, %s, %s, 'General', 'Government Land Bank', %s, '{{}}', CURRENT_TIMESTAMP, {geom_fn})
                         ON CONFLICT (parcel_id) DO UPDATE SET geom = EXCLUDED.geom, area_acres = EXCLUDED.area_acres, infrastructure_details = EXCLUDED.infrastructure_details
                         """,
                         [estate_id, p_id, feat['plot_name'], feat['area_acres'], feat['status'], attrs_json, feat['wkt']]
@@ -508,16 +518,18 @@ def delete_layer_cascade(layer_id):
         cursor.execute("DELETE FROM layer_metadata WHERE layer_id = %s", [layer_id])
 
         # 2. Get estate IDs associated with this layer
+        like_op = "ILIKE" if connection.vendor == 'postgresql' else "LIKE"
         cursor.execute(
-            "SELECT id FROM industrial_estates WHERE name = %s OR name ILIKE %s OR name ILIKE %s",
+            f"SELECT id FROM industrial_estates WHERE name = %s OR name {like_op} %s OR name {like_op} %s",
             [estate_name, f"%{layer_name}%", f"%{display_name}%"]
         )
         estate_ids = [r[0] for r in cursor.fetchall()]
 
         # 3. Delete land parcels linked to these estates
         if estate_ids:
-            cursor.execute("DELETE FROM land_parcels WHERE estate_id = ANY(%s)", [estate_ids])
-            cursor.execute("DELETE FROM industrial_estates WHERE id = ANY(%s)", [estate_ids])
+            placeholders = ','.join(['%s'] * len(estate_ids))
+            cursor.execute(f"DELETE FROM land_parcels WHERE estate_id IN ({placeholders})", estate_ids)
+            cursor.execute(f"DELETE FROM industrial_estates WHERE id IN ({placeholders})", estate_ids)
 
         # 4. Delete the GIS layer entry
         cursor.execute("DELETE FROM gis_layers WHERE id = %s", [layer_id])

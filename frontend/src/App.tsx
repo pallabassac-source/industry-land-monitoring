@@ -51,6 +51,20 @@ const extractWktCenter = (wkt: any): [number, number] => {
   return [91.76, 26.18];
 };
 
+type TabType = 'dashboard' | 'map' | 'inventory' | 'layers' | 'upload' | 'settings' | 'audit';
+
+const parseCurrentRoute = (): TabType => {
+  if (typeof window === 'undefined') return 'dashboard';
+  const pathPart = window.location.pathname.replace(/^\/+/, '').split('/')[0].toLowerCase();
+  const hashPart = window.location.hash.replace(/^#\/?/, '').split('/')[0].toLowerCase();
+  const candidate = pathPart || hashPart;
+  const validTabs: TabType[] = ['dashboard', 'map', 'inventory', 'layers', 'upload', 'settings', 'audit'];
+  if (validTabs.includes(candidate as TabType)) {
+    return candidate as TabType;
+  }
+  return 'dashboard';
+};
+
 export default function App() {
   const {
     currentUser,
@@ -83,9 +97,40 @@ export default function App() {
 
   const [username, setUsername] = useState('gisadmin');
   const [password, setPassword] = useState('gisadmin');
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'map' | 'inventory' | 'layers' | 'upload' | 'settings' | 'audit'>('dashboard');
+  const [activeTab, setActiveTabState] = useState<TabType>(parseCurrentRoute);
   const [isMapExpanded, setIsMapExpanded] = useState(true);
   const [authError, setAuthError] = useState('');
+
+  const navigateTo = (tab: TabType, extraQuery?: string) => {
+    setActiveTabState(tab);
+    const targetPath = tab === 'dashboard' ? '/' : `/${tab}`;
+    const fullPath = extraQuery ? `${targetPath}?${extraQuery}` : targetPath;
+    if (window.location.pathname !== targetPath || extraQuery) {
+      window.history.pushState({ tab }, '', fullPath);
+    }
+  };
+
+  const setActiveTab = (tab: TabType) => {
+    navigateTo(tab);
+  };
+
+  // Sync route when browser Back / Forward buttons are clicked
+  React.useEffect(() => {
+    const handlePopState = () => {
+      setActiveTabState(parseCurrentRoute());
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  // Update browser URL if on initial load or route differs
+  React.useEffect(() => {
+    const current = parseCurrentRoute();
+    if (current !== activeTab) {
+      const targetPath = activeTab === 'dashboard' ? '/' : `/${activeTab}`;
+      window.history.replaceState({ tab: activeTab }, '', targetPath);
+    }
+  }, [activeTab]);
 
   // Handle Login
   const handleLoginSubmit = async (e: React.FormEvent) => {
@@ -394,27 +439,27 @@ export default function App() {
         )}
 
         {/* Master Workspace Layout */}
-        <div className="flex-1 flex overflow-hidden">
-          {activeTab === 'map' ? (
-            <>
-              {/* GIS Map Workspace */}
-              <div className={`transition-all duration-300 ${isMapExpanded ? 'w-full' : 'w-1/2'} h-full`}>
-                <MapView isMapExpanded={isMapExpanded} onToggleSplitScreen={() => setIsMapExpanded(!isMapExpanded)} />
+        <div className="flex-1 flex overflow-hidden relative">
+          {/* GIS Map Workspace: Kept mounted in background so WebGL context & tile cache are never destroyed */}
+          <div className={`w-full h-full ${activeTab === 'map' ? 'flex' : 'hidden'}`}>
+            <div className={`transition-all duration-300 ${isMapExpanded ? 'w-full' : 'w-1/2'} h-full`}>
+              <MapView isMapExpanded={isMapExpanded} onToggleSplitScreen={() => setIsMapExpanded(!isMapExpanded)} />
+            </div>
+            {/* Side-by-side Inventory Comparison panel */}
+            {!isMapExpanded && (
+              <div className="w-1/2 h-full bg-slate-50 overflow-hidden flex flex-col border-l border-slate-200 animate-in slide-in-from-right duration-300">
+                <InventoryView onLocateParcel={() => navigateTo('map')} />
               </div>
-              {/* Side-by-side Inventory Comparison panel */}
-              {!isMapExpanded && (
-                <div className="w-1/2 h-full bg-slate-50 overflow-hidden flex flex-col border-l border-slate-200 animate-in slide-in-from-right duration-300">
-                  <InventoryView onLocateParcel={() => setActiveTab('map')} />
-                </div>
-              )}
-            </>
-          ) : (
-            /* Non-Map tabs take 100% of workspace width, hiding map and side panels */
+            )}
+          </div>
+
+          {/* Non-Map tabs take 100% of workspace width */}
+          {activeTab !== 'map' && (
             <div className="w-full h-full bg-slate-50 overflow-hidden flex flex-col">
               {activeTab === 'dashboard' && <DashboardView />}
-              {activeTab === 'inventory' && <InventoryView onLocateParcel={() => setActiveTab('map')} />}
+              {activeTab === 'inventory' && <InventoryView onLocateParcel={() => navigateTo('map')} />}
               {activeTab === 'layers' && <LayersView />}
-              {activeTab === 'upload' && <UploadView onProceedToMap={() => setActiveTab('map')} />}
+              {activeTab === 'upload' && <UploadView onProceedToMap={() => navigateTo('map')} />}
               {activeTab === 'settings' && <SettingsView />}
               {activeTab === 'audit' && <AuditLogsView />}
             </div>

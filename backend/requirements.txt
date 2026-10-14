@@ -10,3 +10,4 @@ shapely>=2.0.1
 pyproj>=3.5.0
 django-filter>=23.2
 pyshp>=2.3.1
+pillow>=10.0.0

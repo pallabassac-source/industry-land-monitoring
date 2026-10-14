@@ -3,7 +3,7 @@ import { useStore } from '../store/useStore.ts';
 import { 
   Layers, Compass, ZoomIn, ZoomOut, Ruler,
   ChevronRight, ChevronDown, Info, Sliders, Search, Home, MapPin, Trash2, Edit3,
-  Filter, X, RefreshCw, CheckCircle2, AlertCircle, Building2
+  Filter, X, RefreshCw, CheckCircle2, AlertCircle, Building2, Camera, Crosshair
 } from 'lucide-react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
@@ -59,13 +59,14 @@ const wktToGeoJson = (wkt: any): any => {
     if (upper.startsWith('MULTIPOLYGON')) {
       const ringMatches = str.match(/\(\s*([0-9\.\,\s\-eE]+)\s*\)/g);
       if (ringMatches) {
-        const coordinates = [ringMatches.map(ring => {
+        const coordinates = ringMatches.map(ring => {
           const clean = ring.replace(/[\(\)]/g, '').trim();
-          return clean.split(',').map(pair => {
+          const ringPts = clean.split(',').map(pair => {
             const [lng, lat] = pair.trim().split(/\s+/).map(Number);
             return [lng, lat];
           }).filter(pt => !isNaN(pt[0]) && !isNaN(pt[1]));
-        })];
+          return [ringPts];
+        });
         return { type: 'MultiPolygon', coordinates };
       }
     } else if (upper.startsWith('POLYGON')) {
@@ -241,14 +242,24 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     toggleLayerVisibility,
     setLayerOpacity,
     deleteLayer,
-    updateLayer
+    updateLayer,
+    droneLayers,
+    activeDroneLayerId,
+    droneLayerOpacity,
+    showDroneLayer,
+    loadDroneLayers,
+    toggleDroneLayer,
+    setShowDroneLayer,
+    setDroneLayerOpacity
   } = useStore();
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<maplibregl.Map | null>(null);
   const activeMarkerRef = useRef<maplibregl.Marker | null>(null);
   const activePopupRef = useRef<maplibregl.Popup | null>(null);
+  const prevActiveDroneLayerIdRef = useRef<number | null>(null);
   const [webGlAvailable, setWebGlAvailable] = useState(true);
+  const [mapLoaded, setMapLoaded] = useState(false);
   const [cursorCoords, setCursorCoords] = useState<{ lng: number; lat: number }>({ lng: 91.760, lat: 26.180 });
   const [drawnPoints, setDrawnPoints] = useState<[number, number][]>([]);
 
@@ -256,6 +267,8 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
   const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
   const [searchBannerOpen, setSearchBannerOpen] = useState(false);
   const [expandedAccordion, setExpandedAccordion] = useState<'layers' | 'measure' | 'identify' | null>('layers');
+  const [showDroneOutline, setShowDroneOutline] = useState(true);
+  const [droneControllerExpanded, setDroneControllerExpanded] = useState(true);
 
   // Search tab local filter values
   const [filterKeyword, setFilterKeyword] = useState('');
@@ -333,7 +346,7 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
       })).filter(f => f.geometry !== null)
     };
 
-    // Default Satellite base map style
+    // Default base map style (Satellite imagery or Dark GIS base for Drone View)
     const mapStyle: maplibregl.StyleSpecification = {
       version: 8,
       glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
@@ -349,11 +362,21 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
       },
       layers: [
         {
+          id: 'bg-layer',
+          type: 'background',
+          paint: {
+            'background-color': '#080d1a'
+          }
+        },
+        {
           id: 'osm',
           type: 'raster',
           source: 'osm',
           minzoom: 0,
-          maxzoom: 22
+          maxzoom: 22,
+          layout: {
+            visibility: basemap === 'drone' ? 'none' : 'visible'
+          }
         }
       ]
     };
@@ -364,6 +387,8 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
       center: [mapCenter[0], mapCenter[1]],
       zoom: mapZoom,
       maxZoom: 22,
+      fadeDuration: 0,
+      maxTileCacheSize: 2000,
       preserveDrawingBuffer: true
     });
 
@@ -696,9 +721,12 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
 
       // Auto-fit camera to active layer bounds
       fitToActiveLayerBounds(map);
+
+      setMapLoaded(true);
     });
 
     return () => {
+      setMapLoaded(false);
       map.remove();
       mapInstanceRef.current = null;
     };
@@ -711,7 +739,7 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     const parcelsVis = parcelsLayer ? (parcelsLayer.isVisible ? 'visible' : 'none') : (anyLayerVisible ? 'visible' : 'none');
 
     const estatesLayer = layers.find(l => l.name === 'estates');
-    const estatesVis = estatesLayer ? (estatesLayer.isVisible ? 'visible' : 'none') : 'none';
+    const estatesVis = estatesLayer ? (estatesLayer.isVisible ? 'visible' : 'none') : (anyLayerVisible ? 'visible' : 'none');
 
     const districtsLayer = layers.find(l => l.name === 'districts');
     const districtsVis = districtsLayer ? (districtsLayer.isVisible ? 'visible' : 'none') : 'visible';
@@ -826,6 +854,129 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
       });
     }
   };
+
+  // Predictive Tile Pre-fetching Algorithm: pre-loads XYZ tiles for the survey footprint in background
+  const prefetchSurveyTiles = (targetLayer: any) => {
+    if (!targetLayer || !targetLayer.tile_url_pattern) return;
+    const bounds = targetLayer.bounds;
+    if (!bounds || bounds.length !== 4) return;
+    const [minLng, minLat, maxLng, maxLat] = bounds;
+    const baseUrl = targetLayer.tile_url_pattern.startsWith('http')
+      ? targetLayer.tile_url_pattern
+      : `${window.location.origin}${targetLayer.tile_url_pattern}`;
+
+    // Pre-cache primary zoom levels (zoom 12-15) in background
+    [12, 13, 14, 15].forEach(z => {
+      const lat2y = (lat: number) => Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, z));
+      const lng2x = (lng: number) => Math.floor((lng + 180) / 360 * Math.pow(2, z));
+      const xMin = lng2x(minLng);
+      const xMax = lng2x(maxLng);
+      const yMin = lat2y(maxLat);
+      const yMax = lat2y(minLat);
+      if ((xMax - xMin + 1) * (yMax - yMin + 1) <= 25) {
+        for (let x = xMin; x <= xMax; x++) {
+          for (let y = yMin; y <= yMax; y++) {
+            const url = baseUrl.replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));
+            const img = new Image();
+            img.src = url;
+          }
+        }
+      }
+    });
+  };
+
+  // Helper to fit map camera smoothly to the exact polygon footprint of a drone survey
+  const fitToDroneSurvey = (targetLayer: any) => {
+    if (!mapInstanceRef.current || !targetLayer) return;
+    const map = mapInstanceRef.current;
+    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+
+    let fp = targetLayer.footprint_geojson;
+    if (typeof fp === 'string') {
+      try { fp = JSON.parse(fp); } catch (e) { fp = null; }
+    }
+
+    const scanCoords = (c: any) => {
+      if (Array.isArray(c[0])) {
+        c.forEach(scanCoords);
+      } else if (typeof c[0] === 'number' && typeof c[1] === 'number') {
+        const [lng, lat] = c;
+        if (!isNaN(lng) && !isNaN(lat)) {
+          if (lng < minLng) minLng = lng;
+          if (lat < minLat) minLat = lat;
+          if (lng > maxLng) maxLng = lng;
+          if (lat > maxLat) maxLat = lat;
+        }
+      }
+    };
+
+    if (fp) {
+      if (fp.coordinates) {
+        scanCoords(fp.coordinates);
+      } else if (fp.geometry && fp.geometry.coordinates) {
+        scanCoords(fp.geometry.coordinates);
+      } else if (fp.features && fp.features.length > 0) {
+        fp.features.forEach((f: any) => {
+          if (f.geometry && f.geometry.coordinates) scanCoords(f.geometry.coordinates);
+        });
+      }
+    }
+
+    // Fallback to bounding box array [minLng, minLat, maxLng, maxLat]
+    if (minLng === Infinity && targetLayer.bounds && targetLayer.bounds.length === 4) {
+      [minLng, minLat, maxLng, maxLat] = targetLayer.bounds;
+    }
+
+    if (minLng !== Infinity && maxLng !== -Infinity && (maxLng - minLng > 0.0001 || maxLat - minLat > 0.0001)) {
+      const currentBounds = map.getBounds();
+      const currentZoom = map.getZoom();
+      // If camera is already looking at this survey extent, skip redundant re-animation
+      const isAlreadyInView = currentBounds.getWest() <= minLng && currentBounds.getEast() >= maxLng &&
+                              currentBounds.getSouth() <= minLat && currentBounds.getNorth() >= maxLat &&
+                              currentZoom >= 13.5;
+      if (!isAlreadyInView) {
+        map.fitBounds(
+          [[minLng, minLat], [maxLng, maxLat]],
+          { padding: 75, maxZoom: 17.5, duration: 600, essential: true, easing: (t) => 1 - Math.pow(1 - t, 3) }
+        );
+      }
+    }
+  };
+
+  // Resize map canvas dynamically when container size changes
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+    const observer = new ResizeObserver(() => {
+      mapInstanceRef.current?.resize();
+    });
+    observer.observe(mapContainerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (mapInstanceRef.current) {
+      setTimeout(() => {
+        mapInstanceRef.current?.resize();
+      }, 50);
+    }
+  }, [isMapExpanded]);
+
+  // Check URL query parameters on mount for direct deep-linking (e.g. /map?view=drone&survey=12)
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const viewParam = params.get('view');
+      const surveyParam = params.get('survey');
+      if (viewParam === 'drone' || viewParam === 'satellite') {
+        setBasemap(viewParam as any);
+        if (viewParam === 'drone') setShowDroneLayer(true);
+      }
+      if (surveyParam) {
+        const id = Number(surveyParam);
+        if (!isNaN(id)) toggleDroneLayer(id);
+      }
+    } catch (e) {}
+  }, []);
 
   useEffect(() => {
     if (mapInstanceRef.current && mapInstanceRef.current.isStyleLoaded()) {
@@ -1112,20 +1263,227 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
     const map = mapInstanceRef.current;
     if (!map.isStyleLoaded()) return;
     
-    let tileUrl = 'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png';
-    if (basemap === 'satellite') {
-      tileUrl = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
-    } else if (basemap === 'light') {
-      tileUrl = 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png';
-    } else if (basemap === 'topo') {
-      tileUrl = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}';
+    if (basemap === 'drone') {
+      // In Drone View, hide base raster tiles so only high-resolution drone imagery is shown
+      if (map.getLayer('osm')) {
+        map.setLayoutProperty('osm', 'visibility', 'none');
+      }
+      setShowDroneLayer(true);
+      const readySurveys = droneLayers.filter(l => l.status === 'READY');
+      const target = droneLayers.find(l => l.id === activeDroneLayerId) || readySurveys[0] || droneLayers[0];
+      if (target) {
+        if (activeDroneLayerId !== target.id) {
+          toggleDroneLayer(target.id);
+        }
+        prefetchSurveyTiles(target);
+        fitToDroneSurvey(target);
+      }
+    } else {
+      // Satellite mode (ArcGIS World Imagery - no API key required)
+      if (map.getLayer('osm')) {
+        map.setLayoutProperty('osm', 'visibility', 'visible');
+      }
     }
-    
-    const source = map.getSource('osm') as maplibregl.RasterTileSource;
-    if (source) {
-      source.setTiles([tileUrl]);
+  }, [basemap, mapLoaded]);
+
+  // Proactively pre-cache drone tiles in background as soon as layers load or active survey changes
+  useEffect(() => {
+    const activeLayer = droneLayers.find(l => l.id === activeDroneLayerId);
+    if (activeLayer) {
+      prefetchSurveyTiles(activeLayer);
     }
-  }, [basemap]);
+  }, [activeDroneLayerId, droneLayers]);
+
+  // Load available drone survey layers on mount
+  useEffect(() => {
+    loadDroneLayers();
+  }, []);
+
+  // Synchronize High-Resolution Drone Raster Tile Layer & Survey Coverage Extent in MapLibre GL JS
+  useEffect(() => {
+    if (!mapInstanceRef.current) return;
+    const map = mapInstanceRef.current;
+    if (!map.isStyleLoaded()) return;
+
+    const activeLayer = droneLayers.find(l => l.id === activeDroneLayerId);
+
+    // 1. Manage Drone Survey Boundary Outline (Exact GeoTIFF Raster Image Coverage Extent)
+    const extentGlow = map.getLayer('drone-survey-extent-glow');
+    const extentLine = map.getLayer('drone-survey-extent-line');
+    const extentLabel = map.getLayer('drone-survey-extent-label');
+
+    if (!showDroneLayer || !showDroneOutline || !activeLayer || (!activeLayer.bounds && !activeLayer.footprint_geojson)) {
+      if (extentLabel) map.setLayoutProperty('drone-survey-extent-label', 'visibility', 'none');
+      if (extentLine) map.setLayoutProperty('drone-survey-extent-line', 'visibility', 'none');
+      if (extentGlow) map.setLayoutProperty('drone-survey-extent-glow', 'visibility', 'none');
+      if (map.getLayer('drone-survey-extent-fill')) map.removeLayer('drone-survey-extent-fill');
+    } else {
+      let geometry: any = null;
+      let rawFp = activeLayer.footprint_geojson;
+
+      // Safely parse JSON string if needed
+      if (typeof rawFp === 'string') {
+        try { rawFp = JSON.parse(rawFp); } catch (e) { rawFp = null; }
+      }
+
+      if (rawFp) {
+        if (rawFp.type === 'FeatureCollection' && rawFp.features && rawFp.features.length > 0) {
+          geometry = rawFp.features[0].geometry;
+        } else if (rawFp.type === 'Feature' && rawFp.geometry) {
+          geometry = rawFp.geometry;
+        } else if ((rawFp.type === 'Polygon' || rawFp.type === 'MultiPolygon') && rawFp.coordinates) {
+          geometry = rawFp;
+        }
+      }
+
+      // Fallback to bounding box rectangle only if no vector geometry exists
+      if (!geometry && activeLayer.bounds && activeLayer.bounds.length === 4) {
+        const [minLng, minLat, maxLng, maxLat] = activeLayer.bounds;
+        geometry = {
+          type: 'Polygon',
+          coordinates: [[
+            [minLng, minLat],
+            [maxLng, minLat],
+            [maxLng, maxLat],
+            [minLng, maxLat],
+            [minLng, minLat]
+          ]]
+        };
+      }
+
+      const extentGeoJson = {
+        type: 'FeatureCollection',
+        features: geometry ? [{
+          type: 'Feature',
+          geometry: geometry,
+          properties: {
+            title: activeLayer.title || activeLayer.estate_name || 'Drone Survey Area',
+            label: `DRONE SURVEY COVERAGE: ${activeLayer.estate_name || activeLayer.title} (5cm High-Res)`
+          }
+        }] : []
+      };
+
+      const extentSource = map.getSource('drone-survey-extent-src') as maplibregl.GeoJSONSource;
+      if (!extentSource) {
+        map.addSource('drone-survey-extent-src', {
+          type: 'geojson',
+          data: extentGeoJson as any
+        });
+
+        // 1a. Glowing Halo Casing
+        map.addLayer({
+          id: 'drone-survey-extent-glow',
+          type: 'line',
+          source: 'drone-survey-extent-src',
+          paint: {
+            'line-color': '#06b6d4',
+            'line-width': 6,
+            'line-opacity': 0.45,
+            'line-blur': 3
+          },
+          layout: {
+            visibility: showDroneLayer && showDroneOutline ? 'visible' : 'none'
+          }
+        });
+
+        // 1b. Sharp Precision Neon Vector Outline Border
+        map.addLayer({
+          id: 'drone-survey-extent-line',
+          type: 'line',
+          source: 'drone-survey-extent-src',
+          paint: {
+            'line-color': '#00f2fe',
+            'line-width': 2.5,
+            'line-dasharray': [4, 2],
+            'line-opacity': 1.0
+          },
+          layout: {
+            visibility: showDroneLayer && showDroneOutline ? 'visible' : 'none'
+          }
+        });
+
+        // 1c. Survey Footprint Identification Badge Label
+        map.addLayer({
+          id: 'drone-survey-extent-label',
+          type: 'symbol',
+          source: 'drone-survey-extent-src',
+          layout: {
+            'text-field': ['get', 'label'],
+            'text-size': 11,
+            'text-anchor': 'top-left',
+            'text-offset': [0.5, 0.5],
+            visibility: showDroneLayer && showDroneOutline ? 'visible' : 'none'
+          },
+          paint: {
+            'text-color': '#22d3ee',
+            'text-halo-color': '#0f172a',
+            'text-halo-width': 2.5
+          }
+        });
+      } else {
+        extentSource.setData(extentGeoJson as any);
+        if (extentGlow) map.setLayoutProperty('drone-survey-extent-glow', 'visibility', showDroneLayer && showDroneOutline ? 'visible' : 'none');
+        if (extentLine) map.setLayoutProperty('drone-survey-extent-line', 'visibility', showDroneLayer && showDroneOutline ? 'visible' : 'none');
+        if (extentLabel) map.setLayoutProperty('drone-survey-extent-label', 'visibility', showDroneLayer && showDroneOutline ? 'visible' : 'none');
+      }
+    }
+
+    // 2. Manage Drone High-Resolution Raster Tiles
+    const hasTiles = activeLayer && (activeLayer.status === 'READY' || activeLayer.tile_url_pattern);
+
+    if (!activeLayer || !hasTiles || !activeLayer.tile_url_pattern) {
+      if (map.getLayer('drone-survey-raster-layer')) map.setLayoutProperty('drone-survey-raster-layer', 'visibility', 'none');
+      return;
+    }
+
+    const tileUrl = activeLayer.tile_url_pattern.startsWith('http')
+      ? activeLayer.tile_url_pattern
+      : `${window.location.origin}${activeLayer.tile_url_pattern}`;
+
+    // If survey ID changed, cleanly recreate source & layer so MapLibre binds new XYZ coordinates & textures fresh
+    const surveyChanged = prevActiveDroneLayerIdRef.current !== activeLayer.id;
+    if (surveyChanged) {
+      if (map.getLayer('drone-survey-raster-layer')) {
+        map.removeLayer('drone-survey-raster-layer');
+      }
+      if (map.getSource('drone-survey-raster-src')) {
+        map.removeSource('drone-survey-raster-src');
+      }
+      prevActiveDroneLayerIdRef.current = activeLayer.id;
+    }
+
+    const beforeLayer = map.getLayer('districts-layer') ? 'districts-layer' : (map.getLayer('estates-layer') ? 'estates-layer' : undefined);
+
+    if (!map.getSource('drone-survey-raster-src')) {
+      map.addSource('drone-survey-raster-src', {
+        type: 'raster',
+        tiles: [tileUrl],
+        tileSize: 256,
+        minzoom: 10,
+        maxzoom: 22
+      });
+
+      map.addLayer({
+        id: 'drone-survey-raster-layer',
+        type: 'raster',
+        source: 'drone-survey-raster-src',
+        paint: {
+          'raster-opacity': droneLayerOpacity,
+          'raster-fade-duration': 0,
+          'raster-resampling': 'linear'
+        },
+        layout: {
+          visibility: showDroneLayer ? 'visible' : 'none'
+        }
+      }, beforeLayer);
+    } else {
+      if (map.getLayer('drone-survey-raster-layer')) {
+        map.setLayoutProperty('drone-survey-raster-layer', 'visibility', showDroneLayer ? 'visible' : 'none');
+        map.setPaintProperty('drone-survey-raster-layer', 'raster-opacity', droneLayerOpacity);
+      }
+    }
+  }, [droneLayers, activeDroneLayerId, showDroneLayer, showDroneOutline, droneLayerOpacity, basemap, mapLoaded]);
+
 
   // Convert lat/lng to simulated SVG coords for fallback
   const toSvgCoords = (coordsStr: string) => {
@@ -2196,17 +2554,24 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
           {/* Basemaps Toggle Floating Menu */}
           <div className="flex flex-col bg-slate-950/90 border border-slate-800 rounded-lg overflow-hidden shadow-2xl p-1 gap-1">
             {[
-              { id: 'streets', label: 'Streets' },
               { id: 'satellite', label: 'Satellite' },
-              { id: 'light', label: 'Light' },
-              { id: 'topo', label: 'Topo' }
+              { id: 'drone', label: 'Drone View' }
             ].map(b => (
               <button
                 key={b.id}
-                onClick={() => setBasemap(b.id as any)}
-                className={`px-2 py-1.5 rounded text-[10px] font-black text-center uppercase tracking-wider transition ${
+                onClick={() => {
+                  setBasemap(b.id as any);
+                  if (b.id === 'drone') {
+                    setShowDroneLayer(true);
+                    const target = droneLayers.find(l => l.id === activeDroneLayerId) || droneLayers[0];
+                    if (target) {
+                      fitToDroneSurvey(target);
+                    }
+                  }
+                }}
+                className={`px-3 py-1.5 rounded text-[10px] font-black text-center uppercase tracking-wider transition ${
                   basemap === b.id 
-                    ? 'bg-gov-blue text-white shadow-md' 
+                    ? (b.id === 'drone' ? 'bg-cyan-500 text-slate-950 shadow-md font-black' : 'bg-gov-blue text-white shadow-md') 
                     : 'text-slate-400 hover:text-white hover:bg-slate-900'
                 }`}
               >
@@ -2214,6 +2579,210 @@ export default function MapView({ isMapExpanded = true, onToggleSplitScreen }: M
               </button>
             ))}
           </div>
+
+          {/* Enhanced High-Resolution Drone Survey Floating Controller */}
+          {droneLayers.length > 0 && (
+            <div className="flex flex-col bg-slate-950/95 border border-cyan-500/40 rounded-xl overflow-hidden shadow-2xl backdrop-blur-xl transition-all duration-300 w-80 text-slate-200">
+              {/* Header with Title & iOS-Style Switch */}
+              <div className="flex items-center justify-between gap-2 px-3 py-2.5 bg-gradient-to-r from-slate-900 via-slate-900 to-cyan-950/40 border-b border-cyan-500/20">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-cyan-500/20 border border-cyan-500/40 text-cyan-400">
+                    <Camera className="w-4 h-4" />
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-xs font-black uppercase tracking-wider text-cyan-200 flex items-center gap-1.5">
+                      Drone Survey
+                      <span className="text-[8px] font-bold px-1.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">5cm GSD</span>
+                    </span>
+                    <span className="text-[9px] text-slate-400 font-mono">
+                      {droneLayers.length} Surveys Available
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {/* Modern Animated iOS-Style Toggle Switch */}
+                  <button 
+                    onClick={() => {
+                      const next = !showDroneLayer;
+                      setShowDroneLayer(next);
+                      if (next) {
+                        const target = droneLayers.find(l => l.id === activeDroneLayerId) || droneLayers[0];
+                        if (target) {
+                          if (activeDroneLayerId !== target.id) toggleDroneLayer(target.id);
+                          fitToDroneSurvey(target);
+                        }
+                      }
+                    }}
+                    role="switch"
+                    aria-checked={showDroneLayer}
+                    className={`relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:ring-offset-2 focus:ring-offset-slate-950 ${
+                      showDroneLayer ? 'bg-cyan-500 shadow-md shadow-cyan-500/50' : 'bg-slate-800'
+                    }`}
+                    title={showDroneLayer ? 'Turn Drone Survey OFF' : 'Turn Drone Survey ON'}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
+                        showDroneLayer ? 'translate-x-5' : 'translate-x-0'
+                      }`}
+                    />
+                  </button>
+
+                  {/* Collapse / Expand widget toggle */}
+                  <button 
+                    onClick={() => setDroneControllerExpanded(!droneControllerExpanded)}
+                    className="p-1 text-slate-400 hover:text-white transition"
+                    title={droneControllerExpanded ? "Minimize Controller" : "Expand Controller"}
+                  >
+                    {droneControllerExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              {/* Collapsible Body Controls */}
+              {droneControllerExpanded && (
+                <div className="p-3 space-y-3 bg-slate-950/80 animate-in fade-in slide-in-from-top-2 duration-200">
+                  {/* Status Banner */}
+                  {(() => {
+                    const activeL = droneLayers.find(l => l.id === activeDroneLayerId);
+                    if (activeL && (activeL.status === 'PROCESSING' || activeL.status === 'PENDING')) {
+                      return (
+                        <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-amber-950/60 border border-amber-500/40 text-[10px]">
+                          <span className="flex items-center gap-1.5 text-amber-300 font-extrabold tracking-wide">
+                            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+                            GENERATING RASTER TILES...
+                          </span>
+                          <span className="font-mono text-amber-200 text-[9px] animate-pulse">
+                            In Progress
+                          </span>
+                        </div>
+                      );
+                    }
+                    if (showDroneLayer) {
+                      return (
+                        <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-cyan-950/50 border border-cyan-500/30 text-[10px]">
+                          <span className="flex items-center gap-1.5 text-emerald-400 font-extrabold tracking-wide">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                            ACTIVE ORTHOMOSAIC
+                          </span>
+                          <span className="font-mono text-cyan-300 font-bold">
+                            {activeL?.resolution_cm_per_px || 5} cm/px
+                          </span>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-900/90 border border-slate-700/60 text-[10px]">
+                        <span className="flex items-center gap-1.5 text-slate-400 font-bold tracking-wide">
+                          <span className="w-2 h-2 rounded-full bg-slate-500"></span>
+                          OVERLAY INACTIVE
+                        </span>
+                        <span className="font-mono text-slate-400 text-[9px]">
+                          Switch OFF
+                        </span>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Estate Survey Selector Dropdown */}
+                  <div className="space-y-1">
+                    <label className="text-[9.5px] font-bold text-slate-400 uppercase tracking-wider block">
+                      Select Estate Survey Layer:
+                    </label>
+                    <select
+                      value={activeDroneLayerId || ''}
+                      onChange={(e) => {
+                        const id = Number(e.target.value);
+                        toggleDroneLayer(id);
+                        const targetLayer = droneLayers.find(l => l.id === id);
+                        if (targetLayer) {
+                          fitToDroneSurvey(targetLayer);
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-cyan-600/50 hover:border-cyan-400 text-white text-[11px] font-bold rounded-lg px-2.5 py-2 focus:outline-none focus:ring-1 focus:ring-cyan-400 transition cursor-pointer"
+                    >
+                      {droneLayers.map(dl => {
+                        const isProcessing = dl.status === 'PROCESSING' || dl.status === 'PENDING';
+                        return (
+                          <option key={dl.id} value={dl.id} className="bg-slate-950 text-white py-1">
+                            {dl.title || dl.estate_name} {dl.estate_name && dl.estate_name !== dl.title ? `(${dl.estate_name})` : ''} - {dl.raw_file_size_mb ? `${dl.raw_file_size_mb} MB` : ''} {isProcessing ? '[Processing...]' : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+
+                  {/* Opacity Slider with Quick Presets */}
+                  <div className="space-y-1.5 bg-slate-900/60 border border-slate-800 rounded-lg p-2.5">
+                    <div className="flex justify-between items-center text-[10px]">
+                      <span className="text-slate-300 font-bold flex items-center gap-1">
+                        <Sliders className="w-3 h-3 text-cyan-400" /> Layer Opacity
+                      </span>
+                      <span className="font-mono font-extrabold text-cyan-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">
+                        {Math.round(droneLayerOpacity * 100)}%
+                      </span>
+                    </div>
+                    
+                    <input 
+                      type="range"
+                      min="0.1"
+                      max="1.0"
+                      step="0.05"
+                      value={droneLayerOpacity}
+                      onChange={(e) => setDroneLayerOpacity(parseFloat(e.target.value))}
+                      className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                    />
+
+                    {/* Quick Preset Buttons */}
+                    <div className="grid grid-cols-4 gap-1 pt-1">
+                      {[0.25, 0.5, 0.75, 1.0].map((val) => (
+                        <button
+                          key={val}
+                          onClick={() => setDroneLayerOpacity(val)}
+                          className={`py-0.5 text-[9px] font-mono font-bold rounded transition ${
+                            Math.abs(droneLayerOpacity - val) < 0.05
+                              ? 'bg-cyan-500 text-slate-950 shadow-xs'
+                              : 'bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700'
+                          }`}
+                        >
+                          {val * 100}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Show Coverage Outline Checkbox & Action Button */}
+                  <div className="flex items-center justify-between pt-1 border-t border-slate-800/80">
+                    <label className="flex items-center gap-2 cursor-pointer text-[10px] font-bold text-slate-300 hover:text-white select-none">
+                      <input 
+                        type="checkbox"
+                        checked={showDroneOutline}
+                        onChange={(e) => setShowDroneOutline(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
+                      />
+                      <span>Coverage Boundary</span>
+                    </label>
+
+                    {(() => {
+                      const activeL = droneLayers.find(l => l.id === activeDroneLayerId);
+                      return activeL ? (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => fitToDroneSurvey(activeL)}
+                            className="px-2 py-1 bg-cyan-500/20 hover:bg-cyan-500 text-cyan-300 hover:text-slate-950 font-extrabold text-[10px] rounded-md border border-cyan-500/40 transition active:scale-95 flex items-center gap-1 shadow-xs cursor-pointer"
+                            title="Center and fit camera to the full extent of this drone survey"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                            <span>Fit Coverage</span>
+                          </button>
+                        </div>
+                      ) : null;
+                    })()}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* MAP CONTAINER CANVAS (MapLibre or SVG fallback) */}

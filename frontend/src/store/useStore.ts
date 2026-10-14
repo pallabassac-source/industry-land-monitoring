@@ -84,6 +84,27 @@ export interface GisLayer {
   metadata?: any;
 }
 
+export interface DroneSurveyLayerItem {
+  id: number;
+  estate: number | null;
+  estate_name: string | null;
+  estate_title?: string | null;
+  title: string;
+  survey_date: string | null;
+  tile_directory: string;
+  tile_url_pattern: string;
+  min_zoom: number;
+  max_zoom: number;
+  bounds: [number, number, number, number]; // [minLng, minLat, maxLng, maxLat]
+  footprint_geojson?: any; // Exact non-rectangular polygon geometry
+  raw_file_size_mb: number;
+  resolution_cm_per_px: number;
+  status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
+  error_message?: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
 export interface AuditLog {
   id: number;
   username: string;
@@ -117,7 +138,7 @@ interface PortalState {
   logout: () => void;
 
   // GIS Workspace Map States
-  basemap: 'satellite' | 'streets' | 'light' | 'topo';
+  basemap: 'satellite' | 'drone';
   layers: GisLayer[];
   selectedFeature: any | null;
   measurementMode: 'none' | 'distance' | 'area';
@@ -125,7 +146,7 @@ interface PortalState {
   bookmarks: Bookmark[];
   mapCenter: [number, number];
   mapZoom: number;
-  setBasemap: (mapType: 'satellite' | 'streets' | 'light' | 'topo') => void;
+  setBasemap: (mapType: 'satellite' | 'drone') => void;
   loadLayers: () => Promise<void>;
   toggleLayerVisibility: (layerId: number) => void;
   setLayerOpacity: (layerId: number, opacity: number) => void;
@@ -193,10 +214,54 @@ interface PortalState {
 
   // Ingestion Spatial Upload Engine
   uploadGisLayer: (payload: File | { shp?: File; dbf?: File; shx?: File; prj?: File }, layerName: string) => Promise<any>;
+  uploadGisLayerChunked: (
+    file: File, 
+    layerName: string, 
+    options?: {
+      chunkSizeMB?: number;
+      delayMs?: number;
+      onProgress?: (progress: ChunkProgressInfo) => void;
+    }
+  ) => Promise<any>;
+
+  // High-Resolution Drone Imagery State & Actions
+  droneLayers: DroneSurveyLayerItem[];
+  activeDroneLayerId: number | null;
+  droneLayerOpacity: number;
+  showDroneLayer: boolean;
+  loadDroneLayers: () => Promise<void>;
+  pollDroneLayersUntilReady: (targetLayerId?: number) => void;
+  uploadDroneImagery: (file: File, estateId?: number, title?: string, surveyDate?: string) => Promise<any>;
+  uploadDroneImageryChunked: (
+    file: File, 
+    estateId?: number, 
+    title?: string, 
+    surveyDate?: string,
+    options?: {
+      chunkSizeMB?: number;
+      delayMs?: number;
+      onProgress?: (progress: ChunkProgressInfo) => void;
+    }
+  ) => Promise<any>;
+  toggleDroneLayer: (id: number | null) => void;
+  setShowDroneLayer: (show: boolean) => void;
+  setDroneLayerOpacity: (opacity: number) => void;
+  deleteDroneLayer: (id: number) => Promise<void>;
 
   // External Integration framework sync
   adapters: any[];
   syncExternalAdapter: (adapterName: string) => Promise<any>;
+}
+
+export interface ChunkProgressInfo {
+  percent: number;
+  currentChunk: number;
+  totalChunks: number;
+  uploadedBytes: number;
+  totalBytes: number;
+  retries: number;
+  statusText: string;
+  isRetrying?: boolean;
 }
 
 // Live Database Datasets
@@ -211,6 +276,18 @@ const MOCK_AUDIT: AuditLog[] = [];
 
 // Core System Layers available in the GIS Control Panel
 const CORE_SYSTEM_LAYERS: GisLayer[] = [
+  {
+    id: 9901,
+    name: 'estates',
+    displayName: 'Industrial Estate Boundaries',
+    category: 'Core Layers',
+    layerType: 'Vector',
+    sourceType: 'PostGIS',
+    isPublished: true,
+    isVisible: true,
+    opacity: 0.9,
+    styleConfig: { outline: '#0284c7', fill: 'rgba(2, 132, 199, 0.12)' }
+  },
   {
     id: 9902,
     name: 'parcels',
@@ -907,5 +984,409 @@ export const useStore = create<PortalState>((set, get) => ({
       features_processed: 12,
       details: 'Mock OGC synchronization adapter completed.'
     };
+  },
+
+  // High-Resolution Drone Imagery State & Actions
+  droneLayers: [],
+  activeDroneLayerId: null,
+  droneLayerOpacity: 1.0,
+  showDroneLayer: true,
+
+  loadDroneLayers: async () => {
+    try {
+      const headers: Record<string, string> = {};
+      if (get().token) {
+        headers['Authorization'] = `Bearer ${get().token}`;
+      }
+      const res = await fetch('/api/drone-layers/', { headers });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          set({ droneLayers: data });
+          // If no active layer selected, default to the first READY one
+          if (get().activeDroneLayerId === null && data.length > 0) {
+            const firstReady = data.find(l => l.status === 'READY' && l.is_active);
+            if (firstReady) {
+              set({ activeDroneLayerId: firstReady.id });
+            }
+          }
+          // If any layer is currently PENDING or PROCESSING, auto-start background polling
+          const hasPending = data.some(l => l.status === 'PENDING' || l.status === 'PROCESSING');
+          if (hasPending) {
+            get().pollDroneLayersUntilReady();
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Could not load drone layers from backend:", e);
+    }
+  },
+
+  pollDroneLayersUntilReady: (targetLayerId?: number) => {
+    if ((window as any).__dronePollInterval && !targetLayerId) {
+      return;
+    }
+    clearInterval((window as any).__dronePollInterval);
+
+    let attempts = 0;
+    const maxAttempts = 120; // 5 minutes max
+
+    (window as any).__dronePollInterval = setInterval(async () => {
+      attempts++;
+      try {
+        const headers: Record<string, string> = {};
+        if (get().token) headers['Authorization'] = `Bearer ${get().token}`;
+        const res = await fetch('/api/drone-layers/', { headers });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data)) {
+            set({ droneLayers: data });
+
+            if (targetLayerId) {
+              const target = data.find(l => l.id === targetLayerId);
+              if (target && target.status === 'READY') {
+                set({ activeDroneLayerId: target.id, showDroneLayer: true });
+              }
+            }
+
+            const hasPending = data.some(l => l.status === 'PENDING' || l.status === 'PROCESSING');
+            if (!hasPending || attempts >= maxAttempts) {
+              clearInterval((window as any).__dronePollInterval);
+              (window as any).__dronePollInterval = null;
+            }
+          }
+        }
+      } catch (e) {
+        if (attempts >= maxAttempts) {
+          clearInterval((window as any).__dronePollInterval);
+          (window as any).__dronePollInterval = null;
+        }
+      }
+    }, 2500);
+  },
+
+  uploadDroneImagery: async (file, estateId, title, surveyDate) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (estateId) formData.append('estate_id', String(estateId));
+    if (title) formData.append('title', title);
+    if (surveyDate) formData.append('survey_date', surveyDate);
+
+    try {
+      const headers: Record<string, string> = {};
+      if (get().token) {
+        headers['Authorization'] = `Bearer ${get().token}`;
+      }
+      const res = await fetch('/api/upload/drone-imagery/', {
+        method: 'POST',
+        headers,
+        body: formData
+      });
+      if (res.ok) {
+        const data = await res.json();
+        // Immediately select this new layer and ensure drone survey layer is ON
+        if (data.layer_id) {
+          set({
+            activeDroneLayerId: data.layer_id,
+            showDroneLayer: true
+          });
+        }
+        await get().loadDroneLayers();
+        get().pollDroneLayersUntilReady(data.layer_id);
+        get().addAuditLogEntry('UPLOAD_DRONE_TIFF', `Uploaded GeoTIFF drone survey: ${title || file.name}`);
+        return data;
+      } else {
+        let errorMsg = `Server returned ${res.status} (${res.statusText || 'Error'})`;
+        if (res.status === 413) {
+          errorMsg = `File exceeds server upload size limit (${(file.size / (1024 * 1024)).toFixed(1)} MB).`;
+        } else {
+          try {
+            const errData = await res.json();
+            if (errData && errData.error) errorMsg = errData.error;
+          } catch {
+            const text = await res.text().catch(() => '');
+            if (text && text.length < 150 && !text.includes('<html')) errorMsg = text;
+          }
+        }
+        throw new Error(errorMsg);
+      }
+    } catch (e: any) {
+      console.error("Drone GeoTIFF upload error:", e);
+      throw e;
+    }
+  },
+
+  toggleDroneLayer: (id) => {
+    set({ activeDroneLayerId: id });
+  },
+
+  setShowDroneLayer: (show) => {
+    set({ showDroneLayer: show });
+  },
+
+  setDroneLayerOpacity: (opacity) => {
+    set({ droneLayerOpacity: opacity });
+  },
+
+  deleteDroneLayer: async (id) => {
+    try {
+      const headers: Record<string, string> = {};
+      if (get().token) {
+        headers['Authorization'] = `Bearer ${get().token}`;
+      }
+      const res = await fetch(`/api/drone-layers/${id}/`, {
+        method: 'DELETE',
+        headers
+      });
+      if (res.ok) {
+        const remaining = get().droneLayers.filter(l => l.id !== id);
+        const nextActive = remaining.find(l => l.status === 'READY') || remaining[0] || null;
+        set({
+          droneLayers: remaining,
+          activeDroneLayerId: get().activeDroneLayerId === id ? (nextActive ? nextActive.id : null) : get().activeDroneLayerId,
+          showDroneLayer: remaining.length === 0 ? false : get().showDroneLayer
+        });
+        await get().loadDroneLayers();
+        get().addAuditLogEntry('DELETE_DRONE_LAYER', `Deleted drone survey layer #${id}`);
+      }
+    } catch (e) {
+      console.error("Error deleting drone survey layer:", e);
+    }
+  },
+
+  // WAF-Friendly, Rate-Limit Safe Chunked Upload Actions
+  uploadDroneImageryChunked: async (file, estateId, title, surveyDate, options) => {
+    const data = await uploadFileInChunks(
+      file,
+      'drone',
+      {
+        estate_id: estateId,
+        title: title || file.name.replace(/\.[^/.]+$/, '').replace(/_/g, ' '),
+        survey_date: surveyDate || new Date().toISOString().split('T')[0]
+      },
+      get().token,
+      options
+    );
+
+    if (data.layer_id) {
+      set({
+        activeDroneLayerId: data.layer_id,
+        showDroneLayer: true
+      });
+    }
+    await get().loadDroneLayers();
+    get().pollDroneLayersUntilReady(data.layer_id);
+    get().addAuditLogEntry('UPLOAD_DRONE_TIFF_CHUNKED', `Uploaded chunked GeoTIFF drone survey: ${title || file.name}`);
+    return data;
+  },
+
+  uploadGisLayerChunked: async (file, layerName, options) => {
+    const data = await uploadFileInChunks(
+      file,
+      'vector',
+      { layer_name: layerName },
+      get().token,
+      options
+    );
+
+    await get().loadLayers();
+    await get().loadInventory();
+    await get().loadDashboardStats();
+    if (data.center_lng && data.center_lat) {
+      set({ mapCenter: [data.center_lng, data.center_lat], mapZoom: 15 });
+    }
+    get().addAuditLogEntry('UPLOAD_GIS_CHUNKED', `Uploaded chunked spatial dataset: ${layerName}`);
+    return data;
   }
 }));
+
+// Resilient Chunked Uploader with Exponential Backoff & Anti-DDoS Pacing
+async function uploadFileInChunks(
+  file: File,
+  fileType: 'drone' | 'vector',
+  metadata: Record<string, any>,
+  token: string | null,
+  options?: {
+    chunkSizeMB?: number;
+    delayMs?: number;
+    onProgress?: (progress: ChunkProgressInfo) => void;
+  }
+) {
+  const chunkSizeMB = options?.chunkSizeMB || 25; // Default 25 MB - optimal for WAFs
+  const chunkSize = chunkSizeMB * 1024 * 1024;
+  const delayMs = options?.delayMs !== undefined ? options.delayMs : 200; // 200ms anti-DDoS pacing
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  const uploadId = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+    ? crypto.randomUUID() 
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+      });
+
+  let uploadedBytes = 0;
+  let totalRetries = 0;
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    const start = chunkIndex * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    const chunkBlob = file.slice(start, end);
+
+    const formData = new FormData();
+    formData.append('upload_id', uploadId);
+    formData.append('chunk_index', String(chunkIndex));
+    formData.append('total_chunks', String(totalChunks));
+    formData.append('file_name', file.name);
+    formData.append('file_type', fileType);
+    formData.append('chunk', chunkBlob, file.name);
+
+    let chunkUploaded = false;
+    let retryAttempt = 0;
+    const MAX_RETRIES = 4;
+
+    while (!chunkUploaded && retryAttempt <= MAX_RETRIES) {
+      try {
+        if (options?.onProgress) {
+          options.onProgress({
+            percent: Math.round((uploadedBytes / file.size) * 100),
+            currentChunk: chunkIndex + 1,
+            totalChunks,
+            uploadedBytes,
+            totalBytes: file.size,
+            retries: totalRetries,
+            statusText: retryAttempt > 0 
+              ? `Retrying chunk ${chunkIndex + 1}/${totalChunks} (Attempt ${retryAttempt})...`
+              : `Uploading chunk ${chunkIndex + 1} of ${totalChunks} (${(chunkBlob.size / (1024 * 1024)).toFixed(1)} MB)...`,
+            isRetrying: retryAttempt > 0
+          });
+        }
+
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
+        const res = await fetch('/api/upload/chunk/', {
+          method: 'POST',
+          headers,
+          body: formData
+        });
+
+        if (res.ok) {
+          chunkUploaded = true;
+          uploadedBytes += chunkBlob.size;
+          if (options?.onProgress) {
+            options.onProgress({
+              percent: Math.round((uploadedBytes / file.size) * 100),
+              currentChunk: chunkIndex + 1,
+              totalChunks,
+              uploadedBytes,
+              totalBytes: file.size,
+              retries: totalRetries,
+              statusText: `Chunk ${chunkIndex + 1}/${totalChunks} accepted by server.`,
+              isRetrying: false
+            });
+          }
+        } else if (res.status === 429 || res.status >= 500) {
+          // WAF rate-limit or proxy buffer error: backoff
+          retryAttempt++;
+          totalRetries++;
+          const backoffDelay = Math.min(Math.pow(2, retryAttempt) * 1500, 15000);
+          if (options?.onProgress) {
+            options.onProgress({
+              percent: Math.round((uploadedBytes / file.size) * 100),
+              currentChunk: chunkIndex + 1,
+              totalChunks,
+              uploadedBytes,
+              totalBytes: file.size,
+              retries: totalRetries,
+              statusText: `WAF rate-limit/throttle (HTTP ${res.status}). Pausing ${Math.round(backoffDelay / 1000)}s before resuming...`,
+              isRetrying: true
+            });
+          }
+          await new Promise(r => setTimeout(r, backoffDelay));
+        } else {
+          let errMsg = `Upload failed on chunk ${chunkIndex + 1}`;
+          try {
+            const errJson = await res.json();
+            if (errJson && errJson.error) errMsg = errJson.error;
+          } catch {}
+          throw new Error(errMsg);
+        }
+      } catch (err: any) {
+        if (retryAttempt < MAX_RETRIES && (err.name === 'TypeError' || err.message?.includes('fetch'))) {
+          retryAttempt++;
+          totalRetries++;
+          const backoffDelay = Math.min(Math.pow(2, retryAttempt) * 1500, 12000);
+          if (options?.onProgress) {
+            options.onProgress({
+              percent: Math.round((uploadedBytes / file.size) * 100),
+              currentChunk: chunkIndex + 1,
+              totalChunks,
+              uploadedBytes,
+              totalBytes: file.size,
+              retries: totalRetries,
+              statusText: `Network drop detected. Auto-resuming in ${Math.round(backoffDelay / 1000)}s...`,
+              isRetrying: true
+            });
+          }
+          await new Promise(r => setTimeout(r, backoffDelay));
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    if (!chunkUploaded) {
+      throw new Error(`Failed to upload chunk ${chunkIndex + 1} after ${MAX_RETRIES} attempts.`);
+    }
+
+    // Anti-DDoS Pacing Delay
+    if (delayMs > 0 && chunkIndex < totalChunks - 1) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  // Finalize & Assemble
+  if (options?.onProgress) {
+    options.onProgress({
+      percent: 100,
+      currentChunk: totalChunks,
+      totalChunks,
+      uploadedBytes: file.size,
+      totalBytes: file.size,
+      retries: totalRetries,
+      statusText: 'All chunks uploaded! Assembling & verifying on server...',
+      isRetrying: false
+    });
+  }
+
+  const completeData = new FormData();
+  completeData.append('upload_id', uploadId);
+  completeData.append('file_name', file.name);
+  completeData.append('file_type', fileType);
+  completeData.append('total_chunks', String(totalChunks));
+  for (const [k, v] of Object.entries(metadata)) {
+    if (v !== undefined && v !== null) {
+      completeData.append(k, String(v));
+    }
+  }
+
+  const completeHeaders: Record<string, string> = {};
+  if (token) completeHeaders['Authorization'] = `Bearer ${token}`;
+
+  const completeRes = await fetch('/api/upload/chunk-complete/', {
+    method: 'POST',
+    headers: completeHeaders,
+    body: completeData
+  });
+
+  if (!completeRes.ok) {
+    let errMsg = 'Failed to assemble uploaded chunks on server.';
+    try {
+      const errJson = await completeRes.json();
+      if (errJson && errJson.error) errMsg = errJson.error;
+    } catch {}
+    throw new Error(errMsg);
+  }
+
+  return await completeRes.json();
+}
+

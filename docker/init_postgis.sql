@@ -135,6 +135,29 @@ CREATE TABLE layer_metadata (
     last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 6b. High-Resolution Drone Survey Layers
+CREATE TABLE drone_survey_layers (
+    id SERIAL PRIMARY KEY,
+    estate_id INTEGER REFERENCES industrial_estates(id) ON DELETE CASCADE,
+    estate_name VARCHAR(150),
+    title VARCHAR(200) NOT NULL,
+    survey_date DATE,
+    tile_directory VARCHAR(255) NOT NULL,
+    tile_url_pattern VARCHAR(500) NOT NULL,
+    min_zoom INTEGER DEFAULT 14,
+    max_zoom INTEGER DEFAULT 21,
+    bounds JSONB DEFAULT '[]'::jsonb,
+    raw_file_size_mb DOUBLE PRECISION DEFAULT 0.0,
+    resolution_cm_per_px DOUBLE PRECISION DEFAULT 5.0,
+    status VARCHAR(50) DEFAULT 'READY',
+    error_message TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_drone_surveys_estate ON drone_survey_layers(estate_id);
+
+
 -- 7. Audit Logging
 CREATE TABLE audit_logs (
     id BIGSERIAL PRIMARY KEY,
