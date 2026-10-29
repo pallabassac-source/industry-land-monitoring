@@ -504,35 +504,37 @@ def auto_repair_projected_geometries():
     """
     repaired_count = 0
     try:
-        with connection.cursor() as cursor:
-            if connection.vendor == 'postgresql':
-                cursor.execute(
-                    "SELECT COUNT(*) FROM industrial_estates WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;"
-                )
-                bad_estates = cursor.fetchone()[0]
-                if bad_estates > 0:
+        from django.db import transaction
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                if connection.vendor == 'postgresql':
                     cursor.execute(
-                        """
-                        UPDATE industrial_estates 
-                        SET geom = ST_Transform(ST_SetSRID(geom, 32646), 4326) 
-                        WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;
-                        """
+                        "SELECT COUNT(*) FROM industrial_estates WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;"
                     )
-                    repaired_count += bad_estates
+                    bad_estates = cursor.fetchone()[0]
+                    if bad_estates > 0:
+                        cursor.execute(
+                            """
+                            UPDATE industrial_estates 
+                            SET geom = ST_Transform(ST_SetSRID(geom, 32646), 4326) 
+                            WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;
+                            """
+                        )
+                        repaired_count += bad_estates
 
-                cursor.execute(
-                    "SELECT COUNT(*) FROM land_parcels WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;"
-                )
-                bad_parcels = cursor.fetchone()[0]
-                if bad_parcels > 0:
                     cursor.execute(
-                        """
-                        UPDATE land_parcels 
-                        SET geom = ST_Transform(ST_SetSRID(geom, 32646), 4326) 
-                        WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;
-                        """
+                        "SELECT COUNT(*) FROM land_parcels WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;"
                     )
-                    repaired_count += bad_parcels
+                    bad_parcels = cursor.fetchone()[0]
+                    if bad_parcels > 0:
+                        cursor.execute(
+                            """
+                            UPDATE land_parcels 
+                            SET geom = ST_Transform(ST_SetSRID(geom, 32646), 4326) 
+                            WHERE ST_YMin(geom) > 90 OR ST_XMin(geom) > 180;
+                            """
+                        )
+                        repaired_count += bad_parcels
     except Exception as e:
         pass
     return repaired_count

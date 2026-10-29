@@ -220,6 +220,7 @@ interface PortalState {
     options?: {
       chunkSizeMB?: number;
       delayMs?: number;
+      uploadId?: string;
       onProgress?: (progress: ChunkProgressInfo) => void;
     }
   ) => Promise<any>;
@@ -240,6 +241,7 @@ interface PortalState {
     options?: {
       chunkSizeMB?: number;
       delayMs?: number;
+      uploadId?: string;
       onProgress?: (progress: ChunkProgressInfo) => void;
     }
   ) => Promise<any>;
@@ -1051,6 +1053,13 @@ export const useStore = create<PortalState>((set, get) => ({
               const target = data.find(l => l.id === targetLayerId);
               if (target && target.status === 'READY') {
                 set({ activeDroneLayerId: target.id, showDroneLayer: true });
+                clearInterval((window as any).__dronePollInterval);
+                (window as any).__dronePollInterval = null;
+                return;
+              } else if (target && target.status === 'FAILED') {
+                clearInterval((window as any).__dronePollInterval);
+                (window as any).__dronePollInterval = null;
+                return;
               }
             }
 
@@ -1206,7 +1215,7 @@ export const useStore = create<PortalState>((set, get) => ({
   }
 }));
 
-// Resilient Chunked Uploader with Exponential Backoff & Anti-DDoS Pacing
+// Resilient Chunked Uploader with Sophos Level 3 DPI Evasion, Exponential Backoff & Resumable Check
 async function uploadFileInChunks(
   file: File,
   fileType: 'drone' | 'vector',
@@ -1215,21 +1224,43 @@ async function uploadFileInChunks(
   options?: {
     chunkSizeMB?: number;
     delayMs?: number;
+    uploadId?: string;
     onProgress?: (progress: ChunkProgressInfo) => void;
   }
 ) {
-  const chunkSizeMB = options?.chunkSizeMB || 25; // Default 25 MB - optimal for WAFs
+  const chunkSizeMB = options?.chunkSizeMB || 25; // Sized appropriately per firewall policy
   const chunkSize = chunkSizeMB * 1024 * 1024;
-  const delayMs = options?.delayMs !== undefined ? options.delayMs : 200; // 200ms anti-DDoS pacing
+  const delayMs = options?.delayMs !== undefined ? options.delayMs : 200; // anti-DDoS pacing
   const totalChunks = Math.ceil(file.size / chunkSize);
-  const uploadId = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+
+  // Generate or reuse session upload ID
+  const uploadId = options?.uploadId || ((typeof crypto !== 'undefined' && crypto.randomUUID) 
     ? crypto.randomUUID() 
     : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
         const r = Math.random() * 16 | 0;
         return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
-      });
+      }));
+
+  // Resumable pre-check: Query server to see if any chunks are already saved for this session
+  let receivedChunksSet = new Set<number>();
+  try {
+    const statusRes = await fetch(`/api/upload/chunk-status/?upload_id=${uploadId}&total_chunks=${totalChunks}`);
+    if (statusRes.ok) {
+      const statusData = await statusRes.json();
+      if (Array.isArray(statusData.received_chunks)) {
+        receivedChunksSet = new Set(statusData.received_chunks);
+      }
+    }
+  } catch {}
 
   let uploadedBytes = 0;
+  // Calculate initial uploaded bytes based on already received chunks
+  for (const idx of receivedChunksSet) {
+    const start = idx * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    uploadedBytes += (end - start);
+  }
+
   let totalRetries = 0;
 
   for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
@@ -1237,17 +1268,42 @@ async function uploadFileInChunks(
     const end = Math.min(start + chunkSize, file.size);
     const chunkBlob = file.slice(start, end);
 
+    // If chunk was already accepted in an earlier resumed attempt, skip uploading
+    if (receivedChunksSet.has(chunkIndex)) {
+      if (options?.onProgress) {
+        options.onProgress({
+          percent: Math.round((uploadedBytes / file.size) * 100),
+          currentChunk: chunkIndex + 1,
+          totalChunks,
+          uploadedBytes,
+          totalBytes: file.size,
+          retries: totalRetries,
+          statusText: `Chunk ${chunkIndex + 1}/${totalChunks} already cached on server (Resumed).`,
+          isRetrying: false
+        });
+      }
+      continue;
+    }
+
     const formData = new FormData();
     formData.append('upload_id', uploadId);
     formData.append('chunk_index', String(chunkIndex));
     formData.append('total_chunks', String(totalChunks));
     formData.append('file_name', file.name);
     formData.append('file_type', fileType);
-    formData.append('chunk', chunkBlob, file.name);
+
+    // CRITICAL FOR SOPHOS / DPI LEVEL 3 FIREWALLS:
+    // Slices of a TIFF file (chunks 1+) do not contain the TIFF magic bytes header (II* or MM*).
+    // If the chunk is named 'survey.tif' in multipart/form-data, Sophos DPI flags it as
+    // 'MIME-type / file-extension spoofing' and blocks the transfer.
+    // Instead, send the chunk as an application/octet-stream fragment with a part filename.
+    const chunkPartName = `part_${String(chunkIndex).padStart(5, '0')}.chunk`;
+    const octetBlob = new Blob([chunkBlob], { type: 'application/octet-stream' });
+    formData.append('chunk', octetBlob, chunkPartName);
 
     let chunkUploaded = false;
     let retryAttempt = 0;
-    const MAX_RETRIES = 4;
+    const MAX_RETRIES = 5;
 
     while (!chunkUploaded && retryAttempt <= MAX_RETRIES) {
       try {
@@ -1290,8 +1346,21 @@ async function uploadFileInChunks(
               isRetrying: false
             });
           }
-        } else if (res.status === 429 || res.status >= 500) {
-          // WAF rate-limit or proxy buffer error: backoff
+        } else if (res.status === 413) {
+          // Firewall or Proxy body size limit exceeded (Sophos / WAF scan buffer)
+          throw new Error(`FIREWALL_PAYLOAD_TOO_LARGE: Proxy/Firewall rejected ${chunkSizeMB} MB chunk (HTTP 413 Payload Too Large). Please select 'Strict Firewall Mode' (2 MB or 1 MB) to fit inside corporate inspection limits.`);
+        } else if (res.status === 403) {
+          // Corporate firewall block (Sophos / FortiGate Web Protection)
+          let blockReason = 'Corporate security firewall or web filter rejected the upload request (HTTP 403 Forbidden).';
+          try {
+            const errText = await res.text();
+            if (errText.includes('Sophos') || errText.includes('firewall') || errText.includes('blocked') || errText.includes('Filter')) {
+              blockReason = 'Blocked by corporate firewall policy (Sophos Level 3 Web Filter). Please enable "Strict Corporate Firewall" profile (2 MB chunks, slower pacing).';
+            }
+          } catch {}
+          throw new Error(blockReason);
+        } else if (res.status === 429 || res.status === 408 || res.status >= 500) {
+          // WAF rate-limit, gateway timeout (proxy scanning delay), or server busy: backoff
           retryAttempt++;
           totalRetries++;
           const backoffDelay = Math.min(Math.pow(2, retryAttempt) * 1500, 15000);
@@ -1303,24 +1372,32 @@ async function uploadFileInChunks(
               uploadedBytes,
               totalBytes: file.size,
               retries: totalRetries,
-              statusText: `WAF rate-limit/throttle (HTTP ${res.status}). Pausing ${Math.round(backoffDelay / 1000)}s before resuming...`,
+              statusText: `Firewall/WAF rate-limit or proxy scan delay (HTTP ${res.status}). Pausing ${Math.round(backoffDelay / 1000)}s...`,
               isRetrying: true
             });
           }
           await new Promise(r => setTimeout(r, backoffDelay));
         } else {
-          let errMsg = `Upload failed on chunk ${chunkIndex + 1}`;
+          let errMsg = `Upload failed on chunk ${chunkIndex + 1} (HTTP ${res.status})`;
           try {
-            const errJson = await res.json();
-            if (errJson && errJson.error) errMsg = errJson.error;
+            const errText = await res.text();
+            try {
+              const errJson = JSON.parse(errText);
+              if (errJson && (errJson.error || errJson.detail)) errMsg = errJson.error || errJson.detail;
+            } catch {
+              if (errText && errText.length < 250 && !errText.includes('<html')) errMsg = errText;
+            }
           } catch {}
           throw new Error(errMsg);
         }
       } catch (err: any) {
-        if (retryAttempt < MAX_RETRIES && (err.name === 'TypeError' || err.message?.includes('fetch'))) {
+        if (err.message && (err.message.includes('FIREWALL_PAYLOAD_TOO_LARGE') || err.message.includes('HTTP 403'))) {
+          throw err;
+        }
+        if (retryAttempt < MAX_RETRIES && (err.name === 'TypeError' || err.message?.includes('fetch') || err.message?.includes('network'))) {
           retryAttempt++;
           totalRetries++;
-          const backoffDelay = Math.min(Math.pow(2, retryAttempt) * 1500, 12000);
+          const backoffDelay = Math.min(Math.pow(2, retryAttempt) * 1500, 15000);
           if (options?.onProgress) {
             options.onProgress({
               percent: Math.round((uploadedBytes / file.size) * 100),
@@ -1329,7 +1406,7 @@ async function uploadFileInChunks(
               uploadedBytes,
               totalBytes: file.size,
               retries: totalRetries,
-              statusText: `Network drop detected. Auto-resuming in ${Math.round(backoffDelay / 1000)}s...`,
+              statusText: `Firewall connection drop detected. Auto-resuming in ${Math.round(backoffDelay / 1000)}s...`,
               isRetrying: true
             });
           }
@@ -1341,10 +1418,10 @@ async function uploadFileInChunks(
     }
 
     if (!chunkUploaded) {
-      throw new Error(`Failed to upload chunk ${chunkIndex + 1} after ${MAX_RETRIES} attempts.`);
+      throw new Error(`Failed to upload chunk ${chunkIndex + 1} after ${MAX_RETRIES} attempts. Connection blocked or throttled by network gateway.`);
     }
 
-    // Anti-DDoS Pacing Delay
+    // Anti-Flood / Anti-DDoS Pacing Delay (critical for Sophos Level 3 flood protection)
     if (delayMs > 0 && chunkIndex < totalChunks - 1) {
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
@@ -1385,10 +1462,15 @@ async function uploadFileInChunks(
   });
 
   if (!completeRes.ok) {
-    let errMsg = 'Failed to assemble uploaded chunks on server.';
+    let errMsg = `Failed to assemble uploaded chunks on server (HTTP ${completeRes.status}).`;
     try {
-      const errJson = await completeRes.json();
-      if (errJson && errJson.error) errMsg = errJson.error;
+      const errText = await completeRes.text();
+      try {
+        const errJson = JSON.parse(errText);
+        if (errJson && (errJson.error || errJson.detail)) errMsg = errJson.error || errJson.detail;
+      } catch {
+        if (errText && errText.length < 250 && !errText.includes('<html')) errMsg = errText;
+      }
     } catch {}
     throw new Error(errMsg);
   }

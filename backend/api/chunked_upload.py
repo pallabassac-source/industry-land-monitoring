@@ -12,13 +12,15 @@ from rest_framework.exceptions import ValidationError
 logger = logging.getLogger(__name__)
 
 # Allowed file extensions per pipeline type
-ALLOWED_DRONE_EXTENSIONS = {'.tif', '.tiff', '.geotiff'}
+ALLOWED_DRONE_EXTENSIONS = {'.tif', '.tiff', '.geotiff', '.cog'}
 ALLOWED_VECTOR_EXTENSIONS = {'.zip', '.shp', '.geojson', '.json', '.gpkg', '.kml', '.csv'}
 
 # Maximum permitted limits to prevent resource exhaustion / DoS (OWASP A04)
-MAX_CHUNK_SIZE_BYTES = 55 * 1024 * 1024  # 55 MB per chunk
-MAX_TOTAL_CHUNKS = 2000                   # Up to 2,000 chunks (~100 GB max)
-MAX_TOTAL_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10 GB total file size
+# MAX_TOTAL_CHUNKS increased to 15,000 to support micro-chunks (1MB - 2MB)
+# required by strict corporate inspection proxies (e.g. Sophos Level 3 DPI) on large drone TIFFs.
+MAX_CHUNK_SIZE_BYTES = 55 * 1024 * 1024       # 55 MB per chunk max
+MAX_TOTAL_CHUNKS = 15000                      # Up to 15,000 chunks (~30 GB max at 2MB chunks)
+MAX_TOTAL_FILE_SIZE = 15 * 1024 * 1024 * 1024  # 15 GB total file size
 
 
 def get_temp_chunks_dir():
@@ -104,7 +106,7 @@ def validate_upload_params(upload_id: str, chunk_index: int, total_chunks: int,
 def save_incoming_chunk(upload_id: str, chunk_index: int, chunk_file):
     """
     Saves an uploaded chunk safely to the session's temporary folder.
-    Uses atomic write to prevent partial reads.
+    Uses atomic file replacement to prevent partial reads.
     """
     session_dir = os.path.join(get_temp_chunks_dir(), upload_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -117,8 +119,14 @@ def save_incoming_chunk(upload_id: str, chunk_index: int, chunk_file):
             dest.write(chunk)
 
     if os.path.exists(final_chunk_path):
-        os.remove(final_chunk_path)
-    os.rename(temp_chunk_path, final_chunk_path)
+        try:
+            os.remove(final_chunk_path)
+        except Exception:
+            pass
+    try:
+        os.replace(temp_chunk_path, final_chunk_path)
+    except Exception:
+        shutil.move(temp_chunk_path, final_chunk_path)
 
     return final_chunk_path
 
@@ -157,10 +165,11 @@ def verify_file_signature(file_path: str, file_type: str, safe_name: str):
     with open(file_path, 'rb') as f:
         header = f.read(16)
 
-    if file_type == 'drone' or ext in ['.tif', '.tiff', '.geotiff']:
+    if file_type == 'drone' or ext in ['.tif', '.tiff', '.geotiff', '.cog']:
         # TIFF magic bytes: Little-endian ('II*\x00') or Big-endian ('MM\x00*')
+        # BigTIFF magic bytes: Little-endian ('II+\x00') or Big-endian ('MM\x00+')
         if not (header.startswith(b'II*\x00') or header.startswith(b'MM\x00*') or header.startswith(b'II+\x00') or header.startswith(b'MM\x00+')):
-            raise ValidationError({"error": "File failed integrity verification: Corrupt or invalid TIFF magic header."})
+            raise ValidationError({"error": "File failed integrity verification: Corrupt or invalid TIFF/BigTIFF magic header."})
 
     elif ext == '.zip':
         # ZIP magic bytes: 'PK\x03\x04' or 'PK\x05\x06' (empty)

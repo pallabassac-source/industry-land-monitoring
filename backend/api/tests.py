@@ -283,3 +283,40 @@ class WebApiTests(TestCase):
         })
         self.assertEqual(bad_uuid_res.status_code, 400)
 
+    def test_drone_chunked_upload_and_firewall_validation(self):
+        """Verify drone GeoTIFF chunking, DPI header validation, and high chunk counts"""
+        import uuid
+        import tempfile
+        import os
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from .chunked_upload import MAX_TOTAL_CHUNKS, verify_file_signature
+
+        # Verify MAX_TOTAL_CHUNKS accommodates micro-chunks for corporate firewalls
+        self.assertGreaterEqual(MAX_TOTAL_CHUNKS, 10000)
+
+        upload_id = str(uuid.uuid4())
+        # Little-endian TIFF header: II*\x00
+        tiff_header = b'II*\x00' + b'\x00' * 200
+        chunk_file = SimpleUploadedFile("part_00000.chunk", tiff_header, content_type="application/octet-stream")
+
+        res = self.client.post('/api/upload/chunk/', {
+            'upload_id': upload_id,
+            'chunk_index': 0,
+            'total_chunks': 1,
+            'file_name': 'corporate_drone_survey.tif',
+            'file_type': 'drone',
+            'chunk': chunk_file
+        })
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['status'], 'chunk_received')
+
+        # Verify BigTIFF signature support
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as f:
+            f.write(b'II+\x00' + b'\x08\x00\x00\x00')
+            bigtiff_path = f.name
+        try:
+            self.assertTrue(verify_file_signature(bigtiff_path, 'drone', 'bigtiff_test.tif'))
+        finally:
+            if os.path.exists(bigtiff_path):
+                os.remove(bigtiff_path)
+

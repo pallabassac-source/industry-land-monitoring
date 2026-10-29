@@ -34,7 +34,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: gis_portal_backend
-    command: gunicorn backend.wsgi:application --bind 0.0.0.0:8000 --workers 3
+    command: gunicorn backend.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 600
     environment:
       - DATABASE_URL=postgres://gis_admin:gis_secure_password_2026@db:5432/industrial_land_bank
       - REDIS_URL=redis://redis:6379/0

@@ -3,12 +3,14 @@ import { useStore, ChunkProgressInfo } from '../store/useStore.ts';
 import { 
   UploadCloud, CheckCircle, AlertTriangle, FileSpreadsheet, Layers, 
   FileText, Check, Trash2, ArrowRight, Camera, Image, Sparkles, CheckCircle2,
-  ShieldCheck, Sliders, RefreshCw, Cpu
+  ShieldCheck, Sliders, RefreshCw, Cpu, ShieldAlert, Lock
 } from 'lucide-react';
 
 interface UploadViewProps {
   onProceedToMap?: () => void;
 }
+
+export type FirewallProfile = 'strict' | 'standard' | 'fast' | 'custom';
 
 export default function UploadView({ onProceedToMap }: UploadViewProps) {
   const { 
@@ -26,11 +28,14 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
   // Mode: 'vector' (Shapefiles/GeoJSON) vs 'drone' (GeoTIFF)
   const [activeTab, setActiveTab] = useState<'vector' | 'drone'>('vector');
 
-  // WAF Defense & Anti-DDoS Chunking State
-  const [chunkSizeMB, setChunkSizeMB] = useState<number>(25); // Default 25 MB - optimal for WAFs
-  const [pacingDelayMs, setPacingDelayMs] = useState<number>(200); // 200 ms anti-DDoS pacing
+  // Enterprise Firewall & WAF Defense State
+  // Defaulting to 'strict' (2 MB chunks, 300ms anti-flood pacing) for Level 3 Sophos/Banking proxies
+  const [firewallProfile, setFirewallProfile] = useState<FirewallProfile>('strict');
+  const [chunkSizeMB, setChunkSizeMB] = useState<number>(2); 
+  const [pacingDelayMs, setPacingDelayMs] = useState<number>(300); 
   const [showWafSettings, setShowWafSettings] = useState<boolean>(false);
   const [chunkProgress, setChunkProgress] = useState<ChunkProgressInfo | null>(null);
+  const [activeUploadSessionId, setActiveUploadSessionId] = useState<string | null>(null);
 
   // Vector Shapefile states
   const [shpFile, setShpFile] = useState<File | null>(null);
@@ -170,23 +175,47 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
     }
   };
 
-  // Submit Drone GeoTIFF Upload (WAF-Safe & Anti-DDoS Chunked)
+  const handleProfileChange = (profile: FirewallProfile) => {
+    setFirewallProfile(profile);
+    if (profile === 'strict') {
+      setChunkSizeMB(2);
+      setPacingDelayMs(300);
+    } else if (profile === 'standard') {
+      setChunkSizeMB(10);
+      setPacingDelayMs(150);
+    } else if (profile === 'fast') {
+      setChunkSizeMB(25);
+      setPacingDelayMs(50);
+    }
+  };
+
+  // Submit Drone GeoTIFF Upload (WAF-Safe, Sophos Level 3 DPI Evasion & Anti-DDoS Chunked)
   const isDroneFormValid = Boolean(droneTifFile && droneSurveyTitle.trim());
-  const handleDroneUploadSubmit = async (e: React.FormEvent) => {
+  const handleDroneUploadSubmit = async (e: React.FormEvent, overrideChunkSize?: number, overridePacing?: number) => {
     e.preventDefault();
     if (!isDroneFormValid || !droneTifFile) return;
+
+    const effectiveChunkSize = overrideChunkSize || chunkSizeMB;
+    const effectivePacing = overridePacing !== undefined ? overridePacing : pacingDelayMs;
 
     setIsDroneUploading(true);
     setDroneUploadReport(null);
     setDroneUploadError(null);
+    
+    // Stable upload session ID per file name & size for resuming
+    const sessionId = activeUploadSessionId || (typeof crypto !== 'undefined' && crypto.randomUUID 
+      ? crypto.randomUUID() 
+      : `session_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+    setActiveUploadSessionId(sessionId);
+
     setChunkProgress({
       percent: 0,
       currentChunk: 1,
-      totalChunks: Math.ceil(droneTifFile.size / (chunkSizeMB * 1024 * 1024)),
+      totalChunks: Math.ceil(droneTifFile.size / (effectiveChunkSize * 1024 * 1024)),
       uploadedBytes: 0,
       totalBytes: droneTifFile.size,
       retries: 0,
-      statusText: 'Initializing rate-limit protected chunked upload...',
+      statusText: `Initializing upload session (${effectiveChunkSize} MB chunks, ${effectivePacing}ms anti-flood pacing)...`,
       isRetrying: false
     });
 
@@ -198,18 +227,27 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
         droneSurveyTitle.trim(),
         droneSurveyDate,
         {
-          chunkSizeMB,
-          delayMs: pacingDelayMs,
+          chunkSizeMB: effectiveChunkSize,
+          delayMs: effectivePacing,
+          uploadId: sessionId,
           onProgress: (p) => setChunkProgress(p)
         }
       );
       setDroneUploadReport(res);
+      setActiveUploadSessionId(null);
       await loadDroneLayers();
     } catch (err: any) {
       setDroneUploadError(err.message || "Failed to process GeoTIFF upload.");
     } finally {
       setIsDroneUploading(false);
     }
+  };
+
+  const retryWithStrictMode = () => {
+    handleProfileChange('strict');
+    setDroneUploadError(null);
+    const dummyEvent = { preventDefault: () => {} } as React.FormEvent;
+    handleDroneUploadSubmit(dummyEvent, 2, 300);
   };
 
   const clearVectorFiles = () => {
@@ -386,14 +424,31 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                 )}
               </div>
 
-              {/* WAF Shield & Anti-DDoS Defense Bar */}
+              {/* Enterprise Firewall & WAF Defense Bar */}
               <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <ShieldCheck className="w-4 h-4 text-emerald-600 flex-shrink-0" />
                     <div>
-                      <p className="font-bold text-slate-800 text-[11px]">WAF Bypass & Anti-DDoS Chunking Active</p>
-                      <p className="text-[10px] text-slate-500">Slices files into {chunkSizeMB} MB chunks with {pacingDelayMs}ms flood protection pacing</p>
+                      <div className="flex items-center gap-2">
+                        <p className="font-bold text-slate-800 text-[11px]">Strict Firewall & Proxy Defense Active</p>
+                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${
+                          firewallProfile === 'strict' 
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' 
+                            : firewallProfile === 'standard'
+                            ? 'bg-blue-100 text-blue-800 border border-blue-300'
+                            : firewallProfile === 'fast'
+                            ? 'bg-purple-100 text-purple-800 border border-purple-300'
+                            : 'bg-amber-100 text-amber-800 border border-amber-300'
+                        }`}>
+                          {firewallProfile === 'strict' ? 'Sophos Level 3 Safe (2 MB)' : `${chunkSizeMB} MB / ${firewallProfile}`}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-500">
+                        {firewallProfile === 'strict' 
+                          ? 'Slices files into 2 MB blocks with generic octet-stream DPI bypass & 300ms flood protection' 
+                          : `Slices files into ${chunkSizeMB} MB blocks with ${pacingDelayMs}ms pacing`}
+                      </p>
                     </div>
                   </div>
                   <button
@@ -402,35 +457,99 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                     className="flex items-center gap-1 text-[11px] font-bold text-slate-600 hover:text-cyan-700 bg-white border border-slate-200 px-2 py-1 rounded-md shadow-xs transition"
                   >
                     <Sliders className="w-3 h-3" />
-                    <span>{showWafSettings ? 'Hide Settings' : 'WAF Tuning'}</span>
+                    <span>{showWafSettings ? 'Hide Tuning' : 'Firewall Profiles'}</span>
+                  </button>
+                </div>
+
+                {/* Firewall Profile Quick Switcher */}
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => handleProfileChange('strict')}
+                    className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border transition flex items-center gap-1 ${
+                      firewallProfile === 'strict'
+                        ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs'
+                        : 'bg-white text-slate-600 border-slate-200 hover:border-emerald-400'
+                    }`}
+                  >
+                    <Lock className="w-2.5 h-2.5" />
+                    <span>Strict Firewall (Sophos Level 3 / 2 MB)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleProfileChange('standard')}
+                    className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border transition ${
+                      firewallProfile === 'standard'
+                        ? 'bg-gov-blue text-white border-gov-blue shadow-xs'
+                        : 'bg-white text-slate-600 border-slate-200 hover:border-blue-400'
+                    }`}
+                  >
+                    Standard WAF (Cloudflare / 10 MB)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleProfileChange('fast')}
+                    className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border transition ${
+                      firewallProfile === 'fast'
+                        ? 'bg-slate-800 text-white border-slate-800 shadow-xs'
+                        : 'bg-white text-slate-600 border-slate-200 hover:border-slate-400'
+                    }`}
+                  >
+                    Fast Intranet / LAN (25 MB)
                   </button>
                 </div>
 
                 {showWafSettings && (
-                  <div className="pt-2 border-t border-slate-200 grid grid-cols-1 sm:grid-cols-2 gap-3 text-[11px]">
-                    <div>
-                      <label className="font-semibold text-slate-700 block mb-1">Slice / Chunk Size:</label>
-                      <select
-                        value={chunkSizeMB}
-                        onChange={(e) => setChunkSizeMB(Number(e.target.value))}
-                        className="w-full bg-white border border-slate-200 rounded px-2 py-1 font-medium focus:border-cyan-500 focus:outline-none"
-                      >
-                        <option value={10}>10 MB (Ultra-Strict WAF / 10MB Limit)</option>
-                        <option value={25}>25 MB (Recommended - Optimal Balance)</option>
-                        <option value={40}>40 MB (Intranet / Fast LAN High Throughput)</option>
-                      </select>
+                  <div className="pt-2 border-t border-slate-200 space-y-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[11px]">
+                      <div>
+                        <label className="font-semibold text-slate-700 block mb-1">Slice / Chunk Size:</label>
+                        <select
+                          value={chunkSizeMB}
+                          onChange={(e) => {
+                            setChunkSizeMB(Number(e.target.value));
+                            setFirewallProfile('custom');
+                          }}
+                          className="w-full bg-white border border-slate-200 rounded px-2 py-1 font-medium focus:border-cyan-500 focus:outline-none"
+                        >
+                          <option value={1}>1 MB (Ultra-Strict Firewall / 1MB Scan Limit)</option>
+                          <option value={2}>2 MB (Strict Corporate Firewall / Sophos Level 3)</option>
+                          <option value={5}>5 MB (Enterprise Proxy / 5MB Buffer Limit)</option>
+                          <option value={10}>10 MB (Standard Enterprise WAF / Cloudflare)</option>
+                          <option value={25}>25 MB (Fast LAN / Intranet High-Throughput)</option>
+                          <option value={50}>50 MB (Gigabit Local Network)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="font-semibold text-slate-700 block mb-1">Anti-DDoS Pacing Delay:</label>
+                        <select
+                          value={pacingDelayMs}
+                          onChange={(e) => {
+                            setPacingDelayMs(Number(e.target.value));
+                            setFirewallProfile('custom');
+                          }}
+                          className="w-full bg-white border border-slate-200 rounded px-2 py-1 font-medium focus:border-cyan-500 focus:outline-none"
+                        >
+                          <option value={50}>50 ms (Fast Intranet)</option>
+                          <option value={150}>150 ms (Standard)</option>
+                          <option value={300}>300 ms (Recommended for Sophos / Anti-Flood)</option>
+                          <option value={500}>500 ms (Strict Corporate Anti-DoS Protection)</option>
+                          <option value={1000}>1000 ms (1s Pacing for Aggressive Gateways)</option>
+                        </select>
+                      </div>
                     </div>
-                    <div>
-                      <label className="font-semibold text-slate-700 block mb-1">Anti-DDoS Pacing Delay:</label>
-                      <select
-                        value={pacingDelayMs}
-                        onChange={(e) => setPacingDelayMs(Number(e.target.value))}
-                        className="w-full bg-white border border-slate-200 rounded px-2 py-1 font-medium focus:border-cyan-500 focus:outline-none"
-                      >
-                        <option value={100}>100 ms (Fast Pacing)</option>
-                        <option value={200}>200 ms (Recommended - Anti-Flood Safe)</option>
-                        <option value={500}>500 ms (Ultra-Polite for Strict Rate-Limiters)</option>
-                      </select>
+
+                    <div className="p-2.5 bg-white rounded border border-slate-200 text-[10px] text-slate-600 space-y-1">
+                      <p className="font-bold text-slate-800 flex items-center gap-1.5">
+                        <ShieldAlert className="w-3.5 h-3.5 text-cyan-700" />
+                        <span>Corporate Firewall & Sophos Level 3 Protection Details:</span>
+                      </p>
+                      <ul className="list-disc pl-4 space-y-0.5 text-slate-500">
+                        <li><strong>DPI Content-Type Bypass:</strong> Chunks are encoded as raw generic stream (<code className="text-cyan-700 font-mono">application/octet-stream</code>) to eliminate false-alarm file-spoofing flags on non-header slices.</li>
+                        <li><strong>Scan Buffer Ceiling:</strong> 2 MB chunks stay well below Sophos/FortiGate proxy memory limits (5MB-10MB), preventing HTTP 413 drops and TCP resets.</li>
+                        <li><strong>Anti-Flood DoS Throttling:</strong> Inter-chunk pacing satisfies rate-limit inspection rules on multi-gigabyte surveys.</li>
+                        <li><strong>Instant Resume:</strong> Interrupted uploads automatically query the server session cache and skip already-verified chunks.</li>
+                      </ul>
                     </div>
                   </div>
                 )}
@@ -469,11 +588,41 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                 )}
               </div>
 
-              {/* Error display */}
+              {/* Error display with Smart Firewall Recovery */}
               {droneUploadError && (
-                <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-rose-700 text-xs flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-                  <span>{droneUploadError}</span>
+                <div className="space-y-2">
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-rose-700 text-xs flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-rose-600" />
+                    <div className="space-y-1">
+                      <p className="font-bold">Upload Interrupted or Blocked</p>
+                      <p className="leading-relaxed">{droneUploadError}</p>
+                    </div>
+                  </div>
+
+                  {(droneUploadError.includes('FIREWALL') || 
+                    droneUploadError.includes('413') || 
+                    droneUploadError.includes('403') || 
+                    droneUploadError.includes('Sophos') || 
+                    droneUploadError.includes('blocked') || 
+                    droneUploadError.includes('drop') || 
+                    droneUploadError.includes('gateway') || 
+                    droneUploadError.includes('Network') ||
+                    droneUploadError.includes('Failed to upload')) && (
+                    <div className="p-3 bg-cyan-50 border border-cyan-200 rounded-lg text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                      <div className="flex items-center gap-2 text-cyan-900">
+                        <ShieldAlert className="w-4 h-4 text-cyan-600 flex-shrink-0" />
+                        <span className="font-medium text-[11px]">Strict network firewall detected. Apply 2 MB Sophos-safe slices and resume?</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={retryWithStrictMode}
+                        className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 text-white font-bold rounded-md shadow-xs transition flex items-center gap-1.5 self-start sm:self-auto text-[11px]"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>Apply Strict 2 MB Mode & Resume</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -509,28 +658,47 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
               const currentStatus = liveDroneLayer ? liveDroneLayer.status : (droneUploadReport.status || 'PROCESSING');
               const isReady = currentStatus === 'READY';
               const isProcessing = currentStatus === 'PROCESSING' || currentStatus === 'PENDING';
+              const isFailed = currentStatus === 'FAILED';
 
               return (
                 <div className={`bg-white p-6 rounded-xl border shadow-sm space-y-4 ${
-                  isReady ? 'border-emerald-300 ring-1 ring-emerald-500/20' : 'border-cyan-300 ring-1 ring-cyan-500/20'
+                  isReady 
+                    ? 'border-emerald-300 ring-1 ring-emerald-500/20' 
+                    : isFailed
+                    ? 'border-rose-300 ring-1 ring-rose-500/20'
+                    : 'border-cyan-300 ring-1 ring-cyan-500/20'
                 }`}>
                   <div className="flex items-center gap-2.5">
                     {isReady ? (
                       <CheckCircle2 className="w-6 h-6 text-emerald-600 flex-shrink-0" />
+                    ) : isFailed ? (
+                      <AlertTriangle className="w-6 h-6 text-rose-600 flex-shrink-0" />
                     ) : (
                       <div className="w-6 h-6 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin flex-shrink-0" />
                     )}
                     <div>
                       <h3 className="font-bold text-sm text-slate-800">
-                        {isReady ? 'Drone Survey Ready & Operational' : 'Generating Multi-Resolution Tiles'}
+                        {isReady 
+                          ? 'Drone Survey Ready & Operational' 
+                          : isFailed
+                          ? 'Tile Pyramid Generation Error'
+                          : 'Generating Multi-Resolution Tiles'}
                       </h3>
                       <p className="text-[11px] text-slate-500">
                         {isReady 
                           ? 'Tile pyramids cached for high-speed MapLibre rendering' 
+                          : isFailed
+                          ? 'The server worker encountered an issue processing the GeoTIFF raster.'
                           : 'GDAL worker is cutting Zoom 14-20 Slippy Map pyramid...'}
                       </p>
                     </div>
                   </div>
+
+                  {isFailed && liveDroneLayer?.error_message && (
+                    <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-[11px] font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
+                      {liveDroneLayer.error_message}
+                    </div>
+                  )}
 
                   <div className="p-3.5 bg-slate-50 rounded-lg space-y-2 text-xs border border-slate-100">
                     <div className="flex justify-between">
@@ -542,6 +710,8 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                       <span className={`font-bold px-2 py-0.5 rounded text-[10px] uppercase tracking-wider ${
                         isReady 
                           ? 'bg-emerald-100 text-emerald-700' 
+                          : isFailed
+                          ? 'bg-rose-100 text-rose-700'
                           : 'bg-amber-100 text-amber-700 animate-pulse'
                       }`}>
                         {currentStatus} {isProcessing ? '(In Progress...)' : ''}
@@ -557,7 +727,7 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                     </div>
                   </div>
 
-                  {onProceedToMap && (
+                  {onProceedToMap && isReady && (
                     <button
                       onClick={() => {
                         if (droneUploadReport.layer_id) {
@@ -566,13 +736,9 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                         }
                         onProceedToMap();
                       }}
-                      className={`w-full py-2.5 rounded-lg font-bold flex items-center justify-center gap-2 transition ${
-                        isReady 
-                          ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm' 
-                          : 'bg-gov-blue hover:bg-blue-700 text-white'
-                      }`}
+                      className="w-full py-2.5 rounded-lg font-bold flex items-center justify-center gap-2 transition bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm"
                     >
-                      <span>{isReady ? 'View High-Res Survey on Map' : 'Proceed to Map View'}</span>
+                      <span>View High-Res Survey on Map</span>
                       <ArrowRight className="w-4 h-4" />
                     </button>
                   )}
@@ -961,8 +1127,17 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
                     <div className="flex items-center gap-2">
                       <ShieldCheck className="w-4 h-4 text-emerald-600 flex-shrink-0" />
                       <div>
-                        <p className="font-bold text-slate-800 text-[11px]">WAF-Safe Chunked Upload Protected</p>
-                        <p className="text-[10px] text-slate-500">Auto-sliced in {chunkSizeMB} MB blocks to prevent firewall payload drops</p>
+                        <div className="flex items-center gap-2">
+                          <p className="font-bold text-slate-800 text-[11px]">Strict Firewall & Proxy Defense Active</p>
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${
+                            firewallProfile === 'strict' 
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' 
+                              : 'bg-blue-100 text-blue-800 border border-blue-300'
+                          }`}>
+                            {firewallProfile === 'strict' ? 'Sophos Level 3 Safe (2 MB)' : `${chunkSizeMB} MB / ${firewallProfile}`}
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-500">Auto-sliced in {chunkSizeMB} MB blocks with {pacingDelayMs}ms pacing to prevent firewall drops</p>
                       </div>
                     </div>
                   </div>
