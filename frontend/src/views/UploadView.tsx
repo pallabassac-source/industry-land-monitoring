@@ -270,7 +270,13 @@ export default function UploadView({ onProceedToMap }: UploadViewProps) {
       {/* Page Header with Mode Switcher */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-5">
         <div>
-          <h1 className="text-xl font-bold text-slate-800">GIS Spatial Data & Imagery Ingestion</h1>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="text-xl font-bold text-slate-800">GIS Spatial Data & Imagery Ingestion</h1>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-xs">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Sophos Level 3 Firewall Safe (2 MB Chunks)</span>
+            </span>
+          </div>
           <p className="text-xs text-slate-500 mt-1">Upload cadastral vector shapefiles or high-resolution GeoTIFF drone orthomosaics with automated multi-resolution pyramid tiling.</p>
         </div>
 
