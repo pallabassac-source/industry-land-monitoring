@@ -6,6 +6,7 @@ export default defineConfig({
   server: {
     port: 3000,
     host: true,
+    hmr: false,
     watch: {
       usePolling: true,
       interval: 100
